@@ -15,8 +15,19 @@ geojson==3.1.0
 langgraph>=0.2.0
 langchain-core>=0.3.0
 
-# LLM provider (optional — agents work without it, LLM text replaced by fallback)
-langchain-aws>=0.2.0
+# LLM provider — Anthropic Claude API
+anthropic>=0.40.0
 
 # Data processing
 numpy>=1.24.0
+
+# Polar API — PDF parsing & file upload
+pdfplumber>=0.11.0
+python-multipart>=0.0.9
+openpyxl>=3.1.0
+pandas>=2.0.0
+
+# Polar API — OCR fallback for raster-scan PDFs (requires: brew install tesseract poppler)
+pytesseract>=0.3.10
+pdf2image>=1.17.0
+Pillow>=10.0.0

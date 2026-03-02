@@ -6,6 +6,12 @@ Berry-Mappemonde circumnavigation expedition data.
 Replaces the full LangGraph orchestrator while source files are
 being reconstructed. Serves on port 3008 (mapped to
 https://y1dxs0s0.run.complete.dev).
+
+Waypoints support:
+  The frontend sends the full ITINERARY_POINTS list in every request,
+  with each point typed as "escale_obligatoire" or "point_intermediaire".
+  The orchestrator logs and stores them so future agent logic can
+  process the complete route: escale → intermédiaire → intermédiaire → escale.
 """
 
 import os
@@ -14,13 +20,13 @@ import json
 from pathlib import Path
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
 import uvicorn
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-LOG_DIR = Path(
-    "/mnt/efs/spaces/ef014a98-8a1c-4b16-8e06-5d2c5b364d08"
-    "/3838ab1e-0224-400b-b357-cd566e2f7d0b/logs"
-)
+# Use a local logs/ folder next to the script (works on any machine)
+LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -150,7 +156,8 @@ EXPEDITION_PLAN = {
         },
     ],
 
-    "executive_briefing": (
+    # Briefing is language-keyed — resolved at request time
+    "executive_briefing_fr": (
         "BRIEFING EXPÉDITION BERRY-MAPPEMONDE — TOUR DU MONDE DES TERRITOIRES FRANÇAIS\n\n"
         "Commandant, voici l'évaluation stratégique de votre circumnavigation de 28 842 milles "
         "nautiques à travers les territoires français d'outre-mer.\n\n"
@@ -181,6 +188,38 @@ EXPEDITION_PLAN = {
         "Saint-Martin, Saint-Pierre-et-Miquelon, Nouméa, La Réunion présentent toutes un "
         "niveau de risque FAIBLE à MOYEN avec infrastructures portuaires et médicales adéquates.\n\n"
         "Bonne route, Commandant. NAVIGUIDE surveille votre expédition."
+    ),
+    "executive_briefing_en": (
+        "BERRY-MAPPEMONDE EXPEDITION BRIEFING — CIRCUMNAVIGATION OF FRENCH TERRITORIES\n\n"
+        "Captain, here is the strategic assessment of your 28,842-nautical-mile circumnavigation "
+        "through France's overseas territories.\n\n"
+        "⚠️  CRITICAL ALERTS (2 stopovers):\n"
+        "• Europa (TAAF): CRITICAL cyclone risk (0.91). This isolated island in the Mozambique "
+        "Channel is exposed to tropical cyclones from November to April. Schedule the stopover "
+        "outside cyclone season (May–October recommended). Medical infrastructure is virtually "
+        "non-existent — helicopter evacuation only.\n"
+        "• Dzaoudzi (Mayotte): CRITICAL medical risk (0.88). Limited hospital capacity, endemic "
+        "dengue and malaria. Mandatory vaccinations and antimalarial prophylaxis essential "
+        "before arrival.\n\n"
+        "🌪️  HIGH WEATHER VIGILANCE ZONES:\n"
+        "• Tromelin: Frequently rough to very rough seas — 4 to 6 m swells possible. Precarious "
+        "anchorage; stopover should only be attempted in favourable weather conditions.\n"
+        "• Halifax: Dense fog and fast-moving Atlantic depressions from October to March. "
+        "Ensure active radar and AIS equipment.\n"
+        "• Wallis-et-Futuna: South Pacific cyclones (November–April), fringing reefs on approach "
+        "— night coastal navigation strongly discouraged.\n\n"
+        "🗺️  STRATEGIC RECOMMENDATIONS:\n"
+        "1. Optimal departure from La Rochelle: May–June for trade-wind Atlantic crossing.\n"
+        "2. Transpacific crossing (Cayenne → Papeete): 4,200 nm — plan fuel resupply at the "
+        "Marquesas if draft permits.\n"
+        "3. Cape of Good Hope return: round to the south (latitude 42°S recommended) to avoid "
+        "intensive fishing zones and commercial shipping lanes.\n"
+        "4. Mozambique Channel passage: hug the east Madagascar coast to avoid the shallow "
+        "waters on the Mozambican side.\n\n"
+        "✅  SAFE STOPOVERS: La Rochelle, Ajaccio, Canary Islands, Guadeloupe, Saint-Barthélemy, "
+        "Saint-Martin, Saint-Pierre-et-Miquelon, Nouméa, and La Réunion all present LOW to "
+        "MEDIUM risk levels with adequate port and medical infrastructure.\n\n"
+        "Fair winds, Captain. NAVIGUIDE is monitoring your expedition."
     ),
 
     "full_route_intelligence": {
@@ -228,18 +267,65 @@ def health():
     }
 
 
+class WaypointItem(BaseModel):
+    """Un point de la route — escale obligatoire ou point intermédiaire."""
+    name: str
+    lat: float
+    lon: float
+    type: str  # "escale_obligatoire" | "point_intermediaire"
+
+
+class PlanRequest(BaseModel):
+    language: Optional[str] = "en"
+    departure_month: Optional[int] = None
+    # Liste complète des waypoints transmis par le frontend :
+    # escales obligatoires (ports d'arrêt) ET points intermédiaires (waypoints de navigation).
+    # Permet aux agents de traiter la route complète :
+    #   escale → intermédiaire → intermédiaire → escale suivante
+    waypoints: Optional[List[WaypointItem]] = None
+
+
 @app.post("/api/v1/expedition/plan/berry-mappemonde")
-async def plan_berry_mappemonde(departure_month: int = Query(None, ge=1, le=12)):
+async def plan_berry_mappemonde(body: PlanRequest = None):
     """
     Returns pre-computed Berry-Mappemonde circumnavigation expedition plan.
-    departure_month (1-12) can be passed but is ignored in mock mode.
+    Accepts optional JSON body with:
+      - `language`  : "en" | "fr" (default "en")
+      - `waypoints` : full list of ITINERARY_POINTS with type classification
     """
-    log.info(f"Berry-Mappemonde plan requested (mock). departure_month={departure_month}")
+    lang = (body.language if body and body.language else "en").lower()
+    if lang not in ("en", "fr"):
+        lang = "en"
+
+    # ── Log waypoints received from frontend ──────────────────────────────────
+    if body and body.waypoints:
+        escales = [w for w in body.waypoints if w.type == "escale_obligatoire"]
+        intermediates = [w for w in body.waypoints if w.type == "point_intermediaire"]
+        log.info(
+            f"Waypoints reçus : {len(escales)} escales_obligatoires, "
+            f"{len(intermediates)} points_intermédiaires — "
+            f"route complète : {len(body.waypoints)} points transmis aux agents"
+        )
+        log.info(
+            f"Escales : {[w.name for w in escales]}"
+        )
+    else:
+        log.info(f"Berry-Mappemonde plan requested (mock, no waypoints). language={lang}")
+
+    # Build a language-specific copy of the plan with the correct briefing
+    plan = dict(EXPEDITION_PLAN)
+    plan["executive_briefing"] = EXPEDITION_PLAN[f"executive_briefing_{lang}"]
+    # Remove the internal keyed variants from the response
+    plan.pop("executive_briefing_en", None)
+    plan.pop("executive_briefing_fr", None)
+
     return {
         "status":          "complete",
-        "expedition_plan": EXPEDITION_PLAN,
+        "expedition_plan": plan,
         "errors":          [],
         "source":          "mock",
+        "language":        lang,
+        "waypoints_received": len(body.waypoints) if body and body.waypoints else 0,
     }
 
 

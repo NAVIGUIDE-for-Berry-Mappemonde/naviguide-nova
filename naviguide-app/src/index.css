@@ -30,6 +30,17 @@
   box-shadow: 0 0 6px rgba(147, 51, 234, 0.6);
 }
 
+/* ── Light mode — invert sidebar panels, preserve images ───────────────────── */
+.light-mode .naviguide-sidebar-panel {
+  filter: invert(1) hue-rotate(180deg);
+}
+.light-mode .naviguide-sidebar-panel img {
+  filter: invert(1) hue-rotate(180deg);
+}
+.light-mode .naviguide-sidebar-toggle {
+  filter: invert(1) hue-rotate(180deg);
+}
+
 
 <system-reminder>
 Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.

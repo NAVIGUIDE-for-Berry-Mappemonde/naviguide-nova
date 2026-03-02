@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Map, { Source, Layer, Marker, Popup } from "react-map-gl/maplibre";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { ITINERARY_POINTS } from "./constants/itineraryPoints";
@@ -7,31 +7,45 @@ import { WindDirectionArrow } from "./components/map/WindDirectionArrow";
 import { getCardinalDirection } from "./utils/getCardinalDirection";
 import { Sidebar } from "./components/Sidebar";
 import { ExportSidebar } from "./components/ExportSidebar";
+import { useLang } from "./i18n/LangContext.jsx";
+import {
+  useMaritimeLayers,
+  MaritimeLayers,
+  MaritimeLayersPanel,
+} from "./components/MaritimeLayers";
+import { useMarkerOffsets } from "./hooks/useMarkerOffsets";
+import { CatamaranMarker } from "./components/CatamaranMarker";
+import { useLegContext } from "./hooks/useLegContext";
 
 const API_URL = import.meta.env.VITE_API_URL;
 const ORCHESTRATOR_URL = import.meta.env.VITE_ORCHESTRATOR_URL;
 
-// ── Orchestrator plan cache (localStorage, 24 h TTL) ─────────────────────────
-const PLAN_CACHE_KEY = "naviguide_expedition_plan_v1";
+// La Rochelle — position de départ du catamaran en mode simulation
+const LA_ROCHELLE_POS = { lat: 46.1541, lon: -1.167 };
+
+// ── Orchestrator plan cache (localStorage, 24 h TTL, per language) ───────────
 const PLAN_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
-function getCachedPlan() {
+function planCacheKey(lang) { return `naviguide_expedition_plan_v2_${lang}`; }
+
+function getCachedPlan(lang) {
   try {
-    const raw = localStorage.getItem(PLAN_CACHE_KEY);
+    const raw = localStorage.getItem(planCacheKey(lang));
     if (!raw) return null;
     const { data, ts } = JSON.parse(raw);
-    if (Date.now() - ts > PLAN_CACHE_TTL) { localStorage.removeItem(PLAN_CACHE_KEY); return null; }
+    if (Date.now() - ts > PLAN_CACHE_TTL) { localStorage.removeItem(planCacheKey(lang)); return null; }
     return data;
   } catch { return null; }
 }
 
-function setCachedPlan(data) {
-  try { localStorage.setItem(PLAN_CACHE_KEY, JSON.stringify({ data, ts: Date.now() })); } catch {}
+function setCachedPlan(lang, data) {
+  try { localStorage.setItem(planCacheKey(lang), JSON.stringify({ data, ts: Date.now() })); } catch {}
 }
 
 const SEGMENT_BATCH_SIZE = 4; // legs fetched in parallel per batch
 
 export default function App() {
+  const { lang, t } = useLang();
   const mapRef = useRef(null);
   const [segments, setSegments] = useState([]);
   const [points, setPoints] = useState([]);
@@ -52,8 +66,141 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [expeditionPlan, setExpeditionPlan] = useState(null);
 
-  // Export sidebar (right)
+  // Export sidebar (right) — closed by default
   const [exportSidebarOpen, setExportSidebarOpen] = useState(false);
+
+  // Polar data shared between ExportSidebar (upload/VMG) and Sidebar (chat)
+  const [polarData, setPolarData] = useState(null);
+
+  // ── App-wide modes ──────────────────────────────────────────────────────────
+  const [isOffshore,  setIsOffshore]  = useState(true);  // always Offshore (toggles removed)
+  const [isCockpit,   setIsCockpit]   = useState(false); // always Onboarding (toggles removed)
+  const [isLightMode, setIsLightMode] = useState(false); // false=Dark, true=Light
+
+  // ── Maritime data layers (ZEE, WPI Ports, SHOM Balisage) ────────────────────
+  const maritimeLayers = useMaritimeLayers();
+
+  // ── Simulation mode — catamaran draggable ────────────────────────────────────
+  const [simulationMode, setSimulationMode] = useState(false);
+  const [catamaranPos,   setCatamaranPos]   = useState(null);  // { lat, lon }
+  const [simulationStep, setSimulationStep] = useState(0);
+
+  // Position par défaut : La Rochelle (point de départ maritime de l'expédition)
+  const initialCatamaranPos = LA_ROCHELLE_POS;
+  const activeCatamaranPos  = catamaranPos ?? initialCatamaranPos;
+
+  // Flat ordered list of simulation targets built from the REAL route polylines:
+  //   [departure(step 0), mid(seg0), end(seg0), mid(seg1), end(seg1), …]
+  // Using segments[] ensures midpoints lie ON the actual maritime route and
+  // handles all detours (Saint-Pierre, Marigot→Cayenne, etc.) automatically.
+  const simTargets = useMemo(() => {
+    const maritimeSegs = segments.filter(s => !s.nonMaritime && s.coords?.length >= 2);
+    if (maritimeSegs.length === 0) {
+      return [{ lat: LA_ROCHELLE_POS.lat, lon: LA_ROCHELLE_POS.lon }];
+    }
+    // Step 0 = first coord of first maritime segment (La Rochelle departure)
+    const firstCoord = maritimeSegs[0].coords[0];
+    const list = [{ lat: firstCoord[1], lon: firstCoord[0] }];
+    for (const seg of maritimeSegs) {
+      const coords = seg.coords; // [[lon, lat], …]
+      // Midpoint at 50% cumulative Euclidean distance along the polyline
+      let totalLen = 0;
+      const lengths = [];
+      for (let i = 0; i < coords.length - 1; i++) {
+        const l = Math.hypot(coords[i + 1][0] - coords[i][0], coords[i + 1][1] - coords[i][1]);
+        lengths.push(l);
+        totalLen += l;
+      }
+      const halfLen = totalLen / 2;
+      let acc = 0;
+      let mid = null;
+      for (let i = 0; i < lengths.length; i++) {
+        if (acc + lengths[i] >= halfLen) {
+          const t = lengths[i] > 0 ? (halfLen - acc) / lengths[i] : 0;
+          mid = {
+            lat: coords[i][1] + t * (coords[i + 1][1] - coords[i][1]),
+            lon: coords[i][0] + t * (coords[i + 1][0] - coords[i][0]),
+          };
+          break;
+        }
+        acc += lengths[i];
+      }
+      if (!mid) {
+        const m = Math.floor(coords.length / 2);
+        mid = { lat: coords[m][1], lon: coords[m][0] };
+      }
+      const last = coords[coords.length - 1];
+      list.push(mid);
+      list.push({ lat: last[1], lon: last[0] });
+    }
+    return list;
+  }, [segments]);
+
+  // flyTo helper — recenters map on catamaran with smooth animation
+  const flyToPos = useCallback((lat, lon) => {
+    if (!mapRef.current) return;
+    const map = mapRef.current.getMap();
+    if (map) map.flyTo({ center: [lon, lat], zoom: 8, duration: 800 });
+  }, []);
+
+  // Ref flag: true when Next/Prev was clicked and we're waiting for legContext to snap
+  const pendingFlyTo = useRef(false);
+
+  // Next step — advance one position forward in the flat target list
+  const handleSimNext = useCallback(() => {
+    const nextStep = simulationStep + 1;
+    if (nextStep >= simTargets.length) return;
+    const pos = simTargets[nextStep];
+    setSimulationStep(nextStep);
+    setCatamaranPos(pos);
+    pendingFlyTo.current = true; // fly AFTER legContext snaps to the route
+  }, [simulationStep, simTargets]);
+
+  // Previous step — go back one position in the flat target list
+  const handleSimPrev = useCallback(() => {
+    const prevStep = simulationStep - 1;
+    if (prevStep < 0) return;
+    const pos = simTargets[prevStep];
+    setSimulationStep(prevStep);
+    setCatamaranPos(pos);
+    pendingFlyTo.current = true; // fly AFTER legContext snaps to the route
+  }, [simulationStep, simTargets]);
+
+  // Manual drag — re-sync simulationStep to nearest target after snap
+  const handleCatamaranDrag = useCallback((pos) => {
+    setCatamaranPos(pos);
+    let bestIdx = simulationStep;
+    let bestDist = Infinity;
+    simTargets.forEach((t, i) => {
+      const d = Math.hypot(t.lat - pos.lat, t.lon - pos.lon);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    });
+    setSimulationStep(bestIdx);
+  }, [simulationStep, simTargets]);
+
+  // Leg context : snap géométrique + métriques
+  // simulationStep est passé pour contraindre le snap à la bonne portion de
+  // polyligne — évite que le catamaran "saute" sur le tronçon retour quand
+  // l'itinéraire passe deux fois par la même zone (ex: Cap Verde aller/retour).
+  const legContext = useLegContext(
+    simulationMode ? activeCatamaranPos.lat : null,
+    simulationMode ? activeCatamaranPos.lon : null,
+    segments,
+    ITINERARY_POINTS,
+    undefined,                               // speedKnots — valeur par défaut
+    simulationMode ? simulationStep : null,  // contrainte chronologique
+  );
+
+  // After each Next/Prev step, fly to the SNAPPED position (not the raw target)
+  // so the camera always centers on the boat as it appears on the route.
+  useEffect(() => {
+    if (!pendingFlyTo.current || !legContext) return;
+    pendingFlyTo.current = false;
+    flyToPos(legContext.snappedPosition[1], legContext.snappedPosition[0]);
+  }, [legContext, flyToPos]);
+
+  // ── Anti-overlap offsets pour les markers de drapeaux d'escales ──────────
+  const markerOffsets = useMarkerOffsets(points, mapRef);
 
   // Custom imported route (null = show Berry-Mappemonde default route)
   const [customRoute, setCustomRoute] = useState(null); // GeoJSON FeatureCollection
@@ -200,9 +347,9 @@ export default function App() {
   };
 
   const drawingMessage =
-    drawnPoints.length === 0 ? "Choose your starting point" :
-    drawnPoints.length === 1 ? "Choose your first stop" :
-    "Choose your next stop";
+    drawnPoints.length === 0 ? t("drawStart") :
+    drawnPoints.length === 1 ? t("drawFirstStop") :
+    t("drawNextStop");
 
   // Hover state for itinerary stop markers
   const [hoveredPoint, setHoveredPoint] = useState(null);
@@ -268,21 +415,38 @@ export default function App() {
     setSelectedSatellite(null);
   };
 
-  // Fetch orchestrator plan — serve from localStorage cache instantly, refresh in background
+  // Fetch orchestrator plan — serve from localStorage cache instantly, refresh in background.
+  // Re-fetches when language changes to get briefing in the selected language.
   useEffect(() => {
-    const cached = getCachedPlan();
-    if (cached) setExpeditionPlan(cached);                   // instant render from cache
+    const cached = getCachedPlan(lang);
+    if (cached) {
+      setExpeditionPlan(cached);                             // instant render from cache
+    } else {
+      setExpeditionPlan(null);                              // clear stale plan from previous language
+    }
     if (!ORCHESTRATOR_URL) return;
-    fetch(`${ORCHESTRATOR_URL}/api/v1/expedition/plan/berry-mappemonde`, { method: "POST" })
+    fetch(`${ORCHESTRATOR_URL}/api/v1/expedition/plan/berry-mappemonde`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        language: lang,
+        waypoints: ITINERARY_POINTS.map(p => ({
+          name: p.name,
+          lat:  p.lat,
+          lon:  p.lon,
+          type: p.flag ? "escale_obligatoire" : "point_intermediaire",
+        })),
+      }),
+    })
       .then((r) => r.json())
       .then((data) => {
         if (data?.expedition_plan) {
           setExpeditionPlan(data.expedition_plan);
-          setCachedPlan(data.expedition_plan);               // persist for next visit
+          setCachedPlan(lang, data.expedition_plan);         // persist per language
         }
       })
       .catch((err) => console.warn("Orchestrator unavailable:", err));
-  }, []);
+  }, [lang]);
 
   // Points d'intérêt
   useEffect(() => {
@@ -332,6 +496,23 @@ export default function App() {
       to: byName("Saint-Pierre (Saint-Pierre-et-Miquelon)"),
     });
 
+    // ── Segment direction guard ──────────────────────────────────────────────
+    // searoute may return coords in either direction (A→B or B→A).
+    // Ensure the polyline always runs from leg.from → leg.to so that the
+    // bearing calculation (A→B on each sub-segment) points the right way.
+    const sqDist = (coord, point) => {
+      const dLon = coord[0] - point.lon;
+      const dLat = coord[1] - point.lat;
+      return dLon * dLon + dLat * dLat;
+    };
+    const orientCoords = (coords, from, to) => {
+      if (!coords || coords.length < 2) return coords;
+      // If coords[0] is closer to `to` than to `from`, the array is reversed
+      return sqDist(coords[0], to) < sqDist(coords[0], from)
+        ? [...coords].reverse()
+        : coords;
+    };
+
     const fetchLeg = async (leg) => {
       const legKey = `${leg.from.name}|${leg.to.name}`;
       const isNonMaritime = nonMaritimeNames.has(legKey);
@@ -371,7 +552,7 @@ export default function App() {
           if (routeFeature.geometry && routeFeature.geometry.coordinates) {
             return {
               ...leg,
-              coords: routeFeature.geometry.coordinates,
+              coords: orientCoords(routeFeature.geometry.coordinates, leg.from, leg.to),
               windPoints,
               wavePoints,
               currentPoints, // 👈 Et on les ajoute ici
@@ -381,7 +562,7 @@ export default function App() {
         } else if (data.geometry && data.geometry.coordinates) {
           return {
             ...leg,
-            coords: data.geometry.coordinates,
+            coords: orientCoords(data.geometry.coordinates, leg.from, leg.to),
             windPoints: [],
             wavePoints: [],
             nonMaritime: false,
@@ -525,7 +706,10 @@ export default function App() {
         };
 
   return (
-    <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
+    <div
+      style={{ height: "100vh", width: "100vw", position: "relative" }}
+      className={[isLightMode ? "light-mode" : "", isOffshore ? "offshore-mode" : ""].filter(Boolean).join(" ")}
+    >
       <Sidebar
         plan={expeditionPlan}
         open={sidebarOpen}
@@ -535,12 +719,41 @@ export default function App() {
         isDrawing={drawingMode}
         onDrawStart={handleDrawStart}
         onDrawFinish={handleDrawFinish}
+        isCockpit={isCockpit}
+        isOffshore={isOffshore}
+        polarData={polarData}
+        maritimeLayers={maritimeLayers}
+        simulationMode={simulationMode}
+        onSimulationToggle={() => {
+          const entering = !simulationMode;
+          setSimulationMode(entering);
+          if (entering) {
+            // Activation : positionner le catamaran sur La Rochelle
+            setCatamaranPos(LA_ROCHELLE_POS);
+            setSimulationStep(0);
+          } else {
+            setCatamaranPos(null);
+          }
+        }}
+        onNext={handleSimNext}
+        canNext={simulationMode && simulationStep < simTargets.length - 1}
+        onPrev={handleSimPrev}
+        canPrev={simulationMode && simulationStep > 0}
+        legContext={legContext}
       />
       <ExportSidebar
         segments={segments}
         points={points}
         open={exportSidebarOpen}
         onToggle={() => setExportSidebarOpen((o) => !o)}
+        isOffshore={isOffshore}
+        isCockpit={isCockpit}
+        isLightMode={isLightMode}
+        onOffshoreChange={setIsOffshore}
+        onCockpitChange={setIsCockpit}
+        onLightModeChange={setIsLightMode}
+        polarData={polarData}
+        onPolarDataLoaded={setPolarData}
       />
 
       {/* ── Slim loading phase: first-batch spinner, disappears quickly ───── */}
@@ -548,7 +761,7 @@ export default function App() {
         <div className="absolute inset-0 bg-slate-900/80 backdrop-blur-sm flex flex-col items-center justify-center z-10 pointer-events-none">
           <div className="w-10 h-10 border-4 border-blue-400/30 border-t-blue-400 rounded-full animate-spin" />
           <div className="mt-4 text-white/90 text-sm font-medium tracking-wide">
-            Calculating routes…
+            {t("calculatingRoutes")}
           </div>
         </div>
       )}
@@ -557,7 +770,7 @@ export default function App() {
       {!loading && segProgress.done < segProgress.total && (
         <div className="absolute bottom-5 right-5 z-20 flex items-center gap-2 bg-slate-900/90 text-white text-xs font-medium px-3 py-2 rounded-full shadow-lg pointer-events-none">
           <div className="w-3.5 h-3.5 border-2 border-blue-400/40 border-t-blue-400 rounded-full animate-spin" />
-          <span>Routes {segProgress.done}/{segProgress.total}</span>
+          <span>{t("routesProgress", { done: segProgress.done, total: segProgress.total })}</span>
           {/* slim progress bar */}
           <div className="w-20 h-1.5 bg-white/20 rounded-full overflow-hidden">
             <div
@@ -584,7 +797,7 @@ export default function App() {
                 disabled={drawnPoints.length === 0}
                 className={`w-7 h-7 flex items-center justify-center rounded-full bg-white/10 transition-colors
                   ${drawnPoints.length === 0 ? "opacity-30 cursor-not-allowed" : "hover:bg-white/25 cursor-pointer"}`}
-                title="Undo last point"
+                title={t("undoLastPoint")}
               >
                 <Undo2 size={13} />
               </button>
@@ -593,7 +806,7 @@ export default function App() {
                 disabled={!canRedo}
                 className={`w-7 h-7 flex items-center justify-center rounded-full bg-white/10 transition-colors
                   ${!canRedo ? "opacity-30 cursor-not-allowed" : "hover:bg-white/25 cursor-pointer"}`}
-                title="Redo"
+                title={t("redo")}
               >
                 <Redo2 size={13} />
               </button>
@@ -606,7 +819,7 @@ export default function App() {
       {clipboardToast && (
         <div className="absolute top-5 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 bg-slate-900/95 text-white text-xs font-medium px-4 py-2 rounded-full shadow-lg pointer-events-none animate-fadeIn">
           <span>📋</span>
-          <span>{clipboardToast} copié</span>
+          <span>{clipboardToast} {t("copied")}</span>
         </div>
       )}
 
@@ -706,12 +919,12 @@ export default function App() {
               boxShadow:       i === 0
                 ? "0 0 6px rgba(34,197,94,0.7)"
                 : "0 0 4px rgba(96,165,250,0.6)",
-            }} title={i === 0 ? "Starting point" : `Stop ${i}`} />
+            }} title={i === 0 ? t("startingPoint") : `${t("stop")} ${i}`} />
           </Marker>
         ))}
 
-        {/* Points de vent fort — invisibles par défaut, révélés au survol (CSS :hover) */}
-        {segments.flatMap((s, segIdx) =>
+        {/* Points de vent fort — visibles uniquement en mode Offshore */}
+        {isOffshore && segments.flatMap((s, segIdx) =>
           (s.windPoints || []).map((point, i) => {
             const [lon, lat] = point.geometry.coordinates;
             const hasHighWave = point.properties.highWave;
@@ -720,15 +933,15 @@ export default function App() {
               <Marker key={`wind-${segIdx}-${i}`} longitude={lon} latitude={lat}>
                 <div
                   className={`wind-alert-marker${hasHighWave ? " is-wind-wave" : ""}`}
-                  title={hasHighWave ? "Vent fort + Vagues hautes" : "Vent fort"}
+                  title={hasHighWave ? t("strongWindWave") : t("strongWind")}
                 />
               </Marker>
             );
           })
         )}
 
-        {/* 🌊 Points de vagues hautes uniquement (orange) */}
-        {segments.flatMap((s, segIdx) =>
+        {/* 🌊 Points de vagues hautes uniquement (orange) — mode Offshore seulement */}
+        {isOffshore && segments.flatMap((s, segIdx) =>
           (s.wavePoints || [])
             .filter((point) => !point.properties.highWind) // Seulement ceux sans vent fort
             .map((point, i) => {
@@ -749,7 +962,7 @@ export default function App() {
                     body: JSON.stringify({ latitude: lat, longitude: lon }),
                   });
 
-                  if (!res.ok) throw new Error("Erreur API vague");
+                  if (!res.ok) throw new Error(t("waveApiError"));
 
                   const data = await res.json();
 
@@ -763,7 +976,7 @@ export default function App() {
                   setSelectedWave({
                     longitude: lon,
                     latitude: lat,
-                    error: "Impossible to get wave data",
+                    error: t("waveDataError"),
                   });
                 } finally {
                   setWaveLoading(false);
@@ -787,14 +1000,15 @@ export default function App() {
                       boxShadow: "0 0 5px rgba(255,165,0,0.5)",
                       cursor: "pointer",
                     }}
-                    title="Vagues hautes"
+                    title={t("highWaves")}
                   />
                 </Marker>
               );
             })
         )}
 
-        {segments.flatMap((s, segIdx) =>
+        {/* 🔀 Courants — mode Offshore seulement */}
+        {isOffshore && segments.flatMap((s, segIdx) =>
           (s.currentPoints || []).map((point, i) => {
             const [lon, lat] = point.geometry.coordinates;
             const currentData = point.properties.currents;
@@ -834,9 +1048,7 @@ export default function App() {
                     transform: `rotate(${rotation}deg)`,
                     filter: "drop-shadow(0 0 3px rgba(34,197,94,0.5))",
                   }}
-                  title={`Courant: ${currentData?.speed_knots?.toFixed(
-                    2
-                  )} nœuds`}
+                  title={t("currentSpeed", { speed: currentData?.speed_knots?.toFixed(2) })}
                 >
                   <svg
                     width="100"
@@ -1063,7 +1275,7 @@ export default function App() {
               {/* Header */}
               <div className="bg-gradient-to-r from-slate-700 to-slate-800 px-4 py-3 flex items-center justify-between">
                 <div>
-                  <div className="text-white font-semibold text-sm">🛰️ Satellite Data</div>
+                  <div className="text-white font-semibold text-sm">{t("satelliteData")}</div>
                   <div className="text-slate-400 text-xs mt-0.5">
                     {selectedSatellite.lat.toFixed(3)}°, {selectedSatellite.lon.toFixed(3)}°
                   </div>
@@ -1080,11 +1292,11 @@ export default function App() {
               {/* ── Tabs ──────────────────────────────────────────────── */}
               <div className="flex border-b border-slate-200">
                 {[
-                  { key: "wind",    label: "💨 Wind",     active: "text-blue-600 border-b-2 border-blue-600 bg-blue-50" },
-                  { key: "wave",    label: "🌊 Waves",    active: "text-orange-500 border-b-2 border-orange-500 bg-orange-50" },
-                  { key: "current", label: "🔀 Currents", active: "text-emerald-600 border-b-2 border-emerald-600 bg-emerald-50" },
+                  { key: "wind",    label: t("windTab"),     active: "text-blue-600 border-b-2 border-blue-600 bg-blue-50" },
+                  { key: "wave",    label: t("wavesTab"),    active: "text-orange-500 border-b-2 border-orange-500 bg-orange-50" },
+                  { key: "current", label: t("currentsTab"), active: "text-emerald-600 border-b-2 border-emerald-600 bg-emerald-50" },
                   ...(selectedSatellite?.drawPointIndex != null
-                    ? [{ key: "point", label: "📍 Point", active: "text-violet-600 border-b-2 border-violet-600 bg-violet-50" }]
+                    ? [{ key: "point", label: t("pointTab"), active: "text-violet-600 border-b-2 border-violet-600 bg-violet-50" }]
                     : []),
                 ].map(({ key, label, active }) => (
                   <button
@@ -1104,7 +1316,7 @@ export default function App() {
                 {satelliteLoading ? (
                   <div className="flex flex-col items-center py-5">
                     <div className="w-8 h-8 border-4 border-slate-100 border-t-slate-600 rounded-full animate-spin" />
-                    <div className="mt-3 text-slate-500 text-sm">Fetching satellite data…</div>
+                    <div className="mt-3 text-slate-500 text-sm">{t("fetchingSatellite")}</div>
                   </div>
 
                 ) : satelliteTab === "wind" ? (
@@ -1114,7 +1326,7 @@ export default function App() {
                       <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
                         <div className="w-8 h-8 bg-white rounded-md flex items-center justify-center text-lg shadow-sm">💨</div>
                         <div>
-                          <div className="text-xs text-slate-500">Speed</div>
+                          <div className="text-xs text-slate-500">{t("windSpeed")}</div>
                           <div className="text-sm font-semibold text-slate-800">
                             {selectedSatellite.wind.wind_speed_kmh} km/h
                             <span className="ml-2 text-xs text-slate-400 font-normal">
@@ -1127,7 +1339,7 @@ export default function App() {
                       <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
                         <WindDirectionArrow direction={selectedSatellite.wind.wind_direction} />
                         <div>
-                          <div className="text-xs text-slate-500">Direction (from)</div>
+                          <div className="text-xs text-slate-500">{t("windDirection")}</div>
                           <div className="text-sm font-semibold text-slate-800">
                             {selectedSatellite.wind.wind_direction}° {getCardinalDirection(selectedSatellite.wind.wind_direction)}
                           </div>
@@ -1141,7 +1353,7 @@ export default function App() {
                       )}
                     </div>
                   ) : (
-                    <div className="py-4 text-center text-slate-500 text-sm">No wind data available</div>
+                    <div className="py-4 text-center text-slate-500 text-sm">{t("noWindData")}</div>
                   )
 
                 ) : satelliteTab === "wave" ? (
@@ -1151,7 +1363,7 @@ export default function App() {
                       <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
                         <div className="w-8 h-8 bg-white rounded-md flex items-center justify-center text-lg shadow-sm">🌊</div>
                         <div>
-                          <div className="text-xs text-slate-500">Significant Height</div>
+                          <div className="text-xs text-slate-500">{t("waveHeight")}</div>
                           <div className="text-sm font-semibold text-slate-800">
                             {selectedSatellite.wave.significant_wave_height_m} m
                           </div>
@@ -1162,7 +1374,7 @@ export default function App() {
                         <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
                           <div className="w-8 h-8 bg-white rounded-md flex items-center justify-center text-lg shadow-sm">⏱️</div>
                           <div>
-                            <div className="text-xs text-slate-500">Mean Period</div>
+                            <div className="text-xs text-slate-500">{t("wavePeriod")}</div>
                             <div className="text-sm font-semibold text-slate-800">
                               {selectedSatellite.wave.mean_wave_period} s
                             </div>
@@ -1174,7 +1386,7 @@ export default function App() {
                         <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
                           <div className="w-8 h-8 bg-white rounded-md flex items-center justify-center text-lg shadow-sm">🧭</div>
                           <div>
-                            <div className="text-xs text-slate-500">Wave Direction (to)</div>
+                            <div className="text-xs text-slate-500">{t("waveDirection")}</div>
                             <div className="text-sm font-semibold text-slate-800">
                               {selectedSatellite.wave.mean_wave_direction}° {getCardinalDirection(selectedSatellite.wave.mean_wave_direction)}
                             </div>
@@ -1188,7 +1400,7 @@ export default function App() {
                       )}
                     </div>
                   ) : (
-                    <div className="py-4 text-center text-slate-500 text-sm">No wave data available</div>
+                    <div className="py-4 text-center text-slate-500 text-sm">{t("noWaveData")}</div>
                   )
 
                 ) : satelliteTab === "current" ? (
@@ -1199,7 +1411,7 @@ export default function App() {
                       <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
                         <div className="w-8 h-8 bg-white rounded-md flex items-center justify-center text-lg shadow-sm">⚡</div>
                         <div>
-                          <div className="text-xs text-slate-500">Surface Speed</div>
+                          <div className="text-xs text-slate-500">{t("currentSurfaceSpeed")}</div>
                           <div className="text-sm font-semibold text-slate-800">
                             {selectedSatellite.current.speed_knots} kn
                             <span className="ml-2 text-xs text-slate-400 font-normal">
@@ -1212,7 +1424,7 @@ export default function App() {
                       <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg">
                         <div className="w-8 h-8 bg-white rounded-md flex items-center justify-center text-lg shadow-sm">🧭</div>
                         <div>
-                          <div className="text-xs text-slate-500">Direction (toward)</div>
+                          <div className="text-xs text-slate-500">{t("currentDirection")}</div>
                           <div className="text-sm font-semibold text-slate-800">
                             {selectedSatellite.current.direction_deg}° {getCardinalDirection(selectedSatellite.current.direction_deg)}
                           </div>
@@ -1221,11 +1433,11 @@ export default function App() {
                       {/* U/V components */}
                       <div className="flex gap-2">
                         <div className="flex-1 p-2.5 bg-slate-50 rounded-lg">
-                          <div className="text-xs text-slate-500">U (East)</div>
+                          <div className="text-xs text-slate-500">{t("currentEast")}</div>
                           <div className="text-sm font-semibold text-slate-800">{selectedSatellite.current.u_component} m/s</div>
                         </div>
                         <div className="flex-1 p-2.5 bg-slate-50 rounded-lg">
-                          <div className="text-xs text-slate-500">V (North)</div>
+                          <div className="text-xs text-slate-500">{t("currentNorth")}</div>
                           <div className="text-sm font-semibold text-slate-800">{selectedSatellite.current.v_component} m/s</div>
                         </div>
                       </div>
@@ -1236,7 +1448,7 @@ export default function App() {
                       )}
                     </div>
                   ) : (
-                    <div className="py-4 text-center text-slate-500 text-sm">No current data available</div>
+                    <div className="py-4 text-center text-slate-500 text-sm">{t("noCurrentData")}</div>
                   )
 
                 ) : satelliteTab === "point" ? (
@@ -1244,12 +1456,12 @@ export default function App() {
                   <div className="space-y-3">
                     {/* Name field */}
                     <div>
-                      <label className="block text-xs font-semibold text-slate-600 mb-1">Waypoint Name</label>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">{t("waypointName")}</label>
                       <input
                         type="text"
                         value={pointInfoName}
                         onChange={(e) => setPointInfoName(e.target.value)}
-                        placeholder="e.g. Dakar, Tenerife…"
+                        placeholder={t("waypointNamePlaceholder")}
                         className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-400"
                       />
                     </div>
@@ -1258,7 +1470,7 @@ export default function App() {
                     {[0, 1].map((idx) => (
                       <div key={idx}>
                         <label className="block text-xs font-semibold text-slate-600 mb-1">
-                          Flag {idx + 1}
+                          {t("flag")} {idx + 1}
                         </label>
                         {pointInfoFlags[idx] ? (
                           <div className="flex items-center gap-2">
@@ -1275,14 +1487,14 @@ export default function App() {
                               }
                               className="text-xs text-red-500 hover:text-red-700 font-medium transition-colors"
                             >
-                              Remove
+                              {t("removeFlag")}
                             </button>
                           </div>
                         ) : (
                           <label className="flex items-center gap-2 cursor-pointer bg-slate-50
                             border border-dashed border-slate-300 rounded-lg px-3 py-2 text-xs
                             text-slate-500 hover:bg-slate-100 transition-colors">
-                            <span>📁 Upload flag image</span>
+                            <span>{t("uploadFlag")}</span>
                             <input
                               type="file"
                               accept="image/*"
@@ -1311,7 +1523,7 @@ export default function App() {
                       className="w-full py-2 bg-violet-600 hover:bg-violet-700 text-white
                         text-sm font-semibold rounded-lg transition-colors"
                     >
-                      Save &amp; Close
+                      {t("saveClose")}
                     </button>
                   </div>
 
@@ -1321,10 +1533,30 @@ export default function App() {
           </Popup>
         )}
 
+        {/* ── Maritime data layers (ZEE / Ports WPI / Balisage SHOM) ─────── */}
+        <MaritimeLayers
+          showZee={maritimeLayers.showZee}
+          zeeData={maritimeLayers.zeeData}
+          showPorts={maritimeLayers.showPorts}
+          portsData={maritimeLayers.portsData}
+          showBalisage={maritimeLayers.showBalisage}
+          balisageData={maritimeLayers.balisageData}
+        />
+
+        {/* ── Catamaran simulation marker ────────────────────────────────── */}
+        {simulationMode && (
+          <CatamaranMarker
+            latitude={legContext ? legContext.snappedPosition[1] : activeCatamaranPos.lat}
+            longitude={legContext ? legContext.snappedPosition[0] : activeCatamaranPos.lon}
+            bearing={legContext?.bearing ?? 0}
+            onDragEnd={handleCatamaranDrag}
+          />
+        )}
+
         {/* Escales obligatoires — drapeaux toujours visibles, tooltip au survol (hidden during drawing) */}
         {!drawingMode && points.map((p, i) =>
           p.flag !== "" ? (
-            <Marker key={i} longitude={p.lon} latitude={p.lat} anchor="bottom">
+            <Marker key={i} longitude={p.lon} latitude={p.lat} anchor="bottom" offset={markerOffsets[i]}>
               <div
                 onMouseEnter={() => setHoveredPoint(i)}
                 onMouseLeave={() => setHoveredPoint(null)}
@@ -1368,7 +1600,7 @@ export default function App() {
             </Marker>
           ) : (
             /* Waypoints intermédiaires — point bleu toujours visible, tooltip au survol */
-            <Marker key={i} longitude={p.lon} latitude={p.lat}>
+            <Marker key={i} longitude={p.lon} latitude={p.lat} offset={markerOffsets[i]}>
               <div
                 onMouseEnter={() => setHoveredPoint(i)}
                 onMouseLeave={() => setHoveredPoint(null)}

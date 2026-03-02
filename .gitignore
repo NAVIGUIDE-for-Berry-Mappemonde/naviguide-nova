@@ -22,3 +22,15 @@ naviguide-api/.env
 .DS_Store
 Thumbs.db
 naviguide-app/.vite/
+naviguide_workspace/.env
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Polar data (runtime)
+naviguide_workspace/polar_data/
+
+# Vite build output
+naviguide-app/dist/

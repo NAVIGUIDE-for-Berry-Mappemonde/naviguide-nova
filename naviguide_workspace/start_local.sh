@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # NAVIGUIDE — Local Development Startup Script
-# Starts all 4 services: API + Orchestrator + Weather Routing + Frontend
+# Starts all 5 services: API + Orchestrator + Weather Routing + Polar API + Frontend
 #
 # Usage (from project root OR from naviguide_workspace/):
 #   chmod +x naviguide_workspace/start_local.sh
@@ -11,6 +11,7 @@
 #   http://localhost:8000   — naviguide-api           (FastAPI + searoute)
 #   http://localhost:3008   — naviguide-orchestrator  (LangGraph multi-agent)
 #   http://localhost:3010   — naviguide-weather-routing
+#   http://localhost:8001   — polar-api               (polaires voiliers)
 #   http://localhost:5173   — naviguide-app            (Vite React frontend)
 # =============================================================================
 
@@ -29,8 +30,8 @@ warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
 err()     { echo -e "${RED}[✗]${NC} $1"; }
 
 # ── Kill any leftover processes on our ports ──────────────────────────────────
-info "Freeing ports 8000, 3008, 3010, 5173..."
-for PORT in 8000 3008 3010 5173; do
+info "Freeing ports 8000, 3008, 3010, 8001, 5173..."
+for PORT in 8000 3008 3010 8001 5173; do
     lsof -ti tcp:"$PORT" | xargs kill -9 2>/dev/null || true
 done
 
@@ -53,6 +54,8 @@ info "Node: $(node --version)"
 info "Checking Python dependencies..."
 $PYTHON -m pip install -q -r "$PROJECT_ROOT/naviguide-api/requirements.txt" --user 2>/dev/null || true
 $PYTHON -m pip install -q -r "$SCRIPT_DIR/requirements.txt" --user 2>/dev/null || true
+# polar_engine dependencies (numpy, scipy, pdfplumber for polar PDF parsing)
+$PYTHON -m pip install -q numpy scipy pdfplumber openpyxl --user 2>/dev/null || true
 success "Python dependencies ready"
 
 # ── Install frontend dependencies (first run only) ───────────────────────────
@@ -69,6 +72,15 @@ if [ ! -f "$API_DIR/.env" ]; then
 COPERNICUS_USERNAME=berrymappemonde@gmail.com
 COPERNICUS_PASSWORD=Hackmyroute2027
 PORT=8000
+# ── Agents IA simulation — Anthropic Claude (obligatoire pour les agents) ─
+# Renseigner ANTHROPIC_API_KEY pour activer les 4 agents IA en mode simulation.
+# Sans cette clé, les agents affichent un contenu de fallback statique.
+ANTHROPIC_API_KEY=
+# Modèle optionnel (défaut : claude-opus-4-5)
+ANTHROPIC_MODEL=claude-opus-4-5
+# ── Agent météo — StormGlass (optionnel) ──────────────────────────────────
+# Données météo live. Sans clé, l'agent météo utilise la climatologie LLM.
+STORMGLASS_API_KEY=
 ENVEOF
 fi
 API_LOG="$LOG_DIR/naviguide-api.log"
@@ -93,6 +105,15 @@ WEATHER_PID=$!
 echo "$WEATHER_PID" > "$LOG_DIR/weather-routing.pid"
 success "weather-routing started (PID $WEATHER_PID)"
 
+# ── Service 4: Polar API (port 8001) ──────────────────────────────────────────
+# polar_api/ lives inside naviguide_workspace/ (= SCRIPT_DIR), NOT at PROJECT_ROOT
+info "Starting polar-api on :8001..."
+POLAR_LOG="$LOG_DIR/polar_api.log"
+(cd "$SCRIPT_DIR/polar_api" && nohup $PYTHON -m uvicorn main:app --port 8001 --reload > "$POLAR_LOG" 2>&1) &
+POLAR_PID=$!
+echo "$POLAR_PID" > "$LOG_DIR/polar_api.pid"
+success "polar-api started (PID $POLAR_PID)"
+
 # ── Wait for backends to initialise ──────────────────────────────────────────
 info "Waiting 18 s for backends to initialise..."
 sleep 18
@@ -109,8 +130,9 @@ check() {
 check "naviguide-api"     "http://localhost:8000/"
 check "orchestrator"      "http://localhost:3008/"
 check "weather-routing"   "http://localhost:3010/"
+check "polar-api"         "http://localhost:8001/"
 
-# ── Service 4: Frontend (Vite) ────────────────────────────────────────────────
+# ── Service 5: Frontend (Vite) ────────────────────────────────────────────────
 info "Starting Vite frontend on :5173..."
 FRONT_DIR="$PROJECT_ROOT/naviguide-app"
 
@@ -119,10 +141,11 @@ cat > "$FRONT_DIR/.env.local" <<'ENVEOF'
 VITE_API_URL=http://localhost:8000
 VITE_ORCHESTRATOR_URL=http://localhost:3008
 VITE_WEATHER_ROUTING_URL=http://localhost:3010
+VITE_POLAR_API_URL=http://localhost:8001
 ENVEOF
 
 FRONT_LOG="$LOG_DIR/frontend.log"
-(cd "$FRONT_DIR" && nohup npm run dev -- --host > "$FRONT_LOG" 2>&1) &
+(cd "$FRONT_DIR" && nohup npm run dev -- --host --port 5173 > "$FRONT_LOG" 2>&1) &
 FRONT_PID=$!
 echo "$FRONT_PID" > "$LOG_DIR/frontend.pid"
 success "frontend started (PID $FRONT_PID)"
@@ -138,6 +161,7 @@ echo -e "  ${CYAN}Frontend :${NC}         http://localhost:5173"
 echo -e "  ${CYAN}API :${NC}              http://localhost:8000"
 echo -e "  ${CYAN}Orchestrator :${NC}     http://localhost:3008"
 echo -e "  ${CYAN}Weather Routing :${NC}  http://localhost:3010"
+echo -e "  ${CYAN}Polar API :${NC}        http://localhost:8001"
 echo ""
 echo -e "  Logs  →  $LOG_DIR/"
 echo -e "  Stop  →  ${BOLD}./naviguide_workspace/stop_local.sh${NC}"

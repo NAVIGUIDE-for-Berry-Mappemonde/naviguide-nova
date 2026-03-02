@@ -12,6 +12,7 @@ from .nodes import (
     apply_anti_shipping_node,
     validate_safety_node,
     llm_route_advisor_node,
+    fetch_vmg_node,
     generate_route_plan_node,
 )
 
@@ -28,7 +29,10 @@ def build_route_intelligence_agent():
     Flow:
       parse_route → compute_segments → apply_anti_shipping
                   → validate_safety → llm_route_advisor
-                  → generate_route_plan → END
+                  → fetch_vmg       → generate_route_plan → END
+
+    fetch_vmg queries the Polar API for real VMG data when an expedition_id
+    is provided, enabling accurate ETA calculations per segment.
     """
     graph = StateGraph(RouteState)
 
@@ -38,6 +42,7 @@ def build_route_intelligence_agent():
     graph.add_node("apply_anti_shipping",  apply_anti_shipping_node)
     graph.add_node("validate_safety",      validate_safety_node)
     graph.add_node("llm_route_advisor",    llm_route_advisor_node)
+    graph.add_node("fetch_vmg",            fetch_vmg_node)
     graph.add_node("generate_route_plan",  generate_route_plan_node)
 
     # Entry point
@@ -54,7 +59,8 @@ def build_route_intelligence_agent():
     graph.add_edge("compute_segments",    "apply_anti_shipping")
     graph.add_edge("apply_anti_shipping", "validate_safety")
     graph.add_edge("validate_safety",     "llm_route_advisor")
-    graph.add_edge("llm_route_advisor",   "generate_route_plan")
+    graph.add_edge("llm_route_advisor",   "fetch_vmg")
+    graph.add_edge("fetch_vmg",           "generate_route_plan")
     graph.add_edge("generate_route_plan", END)
 
     return graph.compile()

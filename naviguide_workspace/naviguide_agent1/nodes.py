@@ -19,6 +19,10 @@ Graph flow:
 """
 
 import math
+import os
+import urllib.request
+import urllib.error
+import json
 from datetime import datetime
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -253,36 +257,125 @@ Tone: professional, concise, offshore-sailing expertise. Max 120 words."""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NODE 6 — generate_route_plan
+# NODE 6 — fetch_vmg  (optional — skipped gracefully if no polar data available)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Polar API base URL — configurable via POLAR_API_URL env var
+_POLAR_API_URL = os.getenv("POLAR_API_URL", "http://localhost:8004")
+
+# TWS values (kts) used to estimate average offshore boat speed from polars
+_POLAR_SPEED_TWS = ["10", "12", "16"]
+
+
+def fetch_vmg_node(state: RouteState) -> RouteState:
+    """
+    Fetch VMG summary from the Polar API for the given expedition_id.
+
+    - Calls GET {POLAR_API_URL}/api/v1/polar/{expedition_id}/summary
+    - Computes polar_avg_speed = mean of (upwind.speed + downwind.speed) / 2
+      across TWS 10, 12, 16 kts — representative offshore conditions.
+    - Falls back silently if no polar data exists (expedition_id absent or API down).
+
+    The polar_avg_speed replaces the hardcoded avg_speed_knots (10.0) in ETA
+    calculations done by generate_route_plan_node.
+    """
+    expedition_id = state.get("expedition_id")
+    messages      = list(state.get("messages", []))
+
+    if not expedition_id:
+        msg = AIMessage(content="[fetch_vmg] No expedition_id — using default vessel speed for ETAs.")
+        return {**state, "polar_vmg": None, "polar_avg_speed": None, "messages": [msg]}
+
+    url = f"{_POLAR_API_URL}/api/v1/polar/{expedition_id}/summary"
+    try:
+        req  = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data    = json.loads(resp.read().decode())
+            vmg_sum = data.get("vmg_summary", {})
+
+        # Compute a representative average offshore boat speed from the VMG table
+        speeds = []
+        for tws_key in _POLAR_SPEED_TWS:
+            entry = vmg_sum.get(tws_key, {})
+            up_sp = entry.get("upwind",   {}).get("speed", 0)
+            dn_sp = entry.get("downwind", {}).get("speed", 0)
+            if up_sp > 0 and dn_sp > 0:
+                speeds.append((up_sp + dn_sp) / 2.0)
+
+        polar_avg = round(sum(speeds) / len(speeds), 2) if speeds else None
+
+        msg = AIMessage(
+            content=(
+                f"[fetch_vmg] ✅ Polar data loaded for '{expedition_id}' "
+                f"(boat: {data.get('boat_name', '?')}) — "
+                f"polar_avg_speed={polar_avg} kts "
+                f"(based on TWS {', '.join(_POLAR_SPEED_TWS)} kts)"
+            )
+        )
+        return {**state, "polar_vmg": vmg_sum, "polar_avg_speed": polar_avg, "messages": [msg]}
+
+    except (urllib.error.URLError, Exception) as exc:
+        msg = AIMessage(
+            content=(
+                f"[fetch_vmg] Polar API unavailable for '{expedition_id}' ({exc}). "
+                "Falling back to vessel default speed."
+            )
+        )
+        return {**state, "polar_vmg": None, "polar_avg_speed": None, "messages": [msg]}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NODE 7 — generate_route_plan
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_route_plan_node(state: RouteState) -> RouteState:
     """
     Assemble the final enriched GeoJSON FeatureCollection — the 'digital twin'
     of the expedition as specified in the NAVIGUIDE V1 functional spec.
+
+    ETA computation:
+      - Uses polar_avg_speed (kts) if polar data was loaded by fetch_vmg_node.
+      - Falls back to vessel_specs.avg_speed_knots (default 10.0 kts) otherwise.
     """
     segments  = state.get("raw_segments", [])
     waypoints = state.get("waypoints", [])
     scores    = state.get("anti_shipping_scores", [])
 
-    total_nm = sum(s.get("distance_nm", 0) for s in segments)
+    total_nm  = sum(s.get("distance_nm", 0) for s in segments)
     avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
 
-    features = []
+    # ── Speed source for ETA ──────────────────────────────────────────────────
+    polar_avg_speed  = state.get("polar_avg_speed")              # from polar API
+    vessel_avg_speed = (
+        state.get("vessel_specs", {}).get("avg_speed_knots")
+        or BerryMappemondeRouter.VESSEL_PROFILE["avg_speed_knots"]
+    )
+    eta_speed    = polar_avg_speed if polar_avg_speed else vessel_avg_speed
+    polar_active = polar_avg_speed is not None
+
+    total_eta_hours = 0.0
+    features        = []
 
     # ── LineString features (route legs) ──────────────────────────────────────
     for seg in segments:
+        dist_nm   = seg.get("distance_nm", 0)
+        eta_hours = round(dist_nm / eta_speed, 2) if eta_speed > 0 else 0.0
+        eta_days  = round(eta_hours / 24.0, 2)
+        total_eta_hours += eta_hours
+
         features.append({
             "type":     "Feature",
             "geometry": seg["geometry"],
             "properties": {
-                "segment_id":         seg["segment_id"],
-                "from_port":          seg["from"],
-                "to_port":            seg["to"],
-                "distance_nm":        seg.get("distance_nm", 0),
-                "anti_shipping_score": seg.get("anti_shipping_score", 0),
-                "traffic_avoidance":  seg.get("traffic_avoidance", "unknown"),
-                "safety_flag":        seg.get("safety_flag", "CLEAR"),
+                "segment_id":           seg["segment_id"],
+                "from_port":            seg["from"],
+                "to_port":              seg["to"],
+                "distance_nm":          dist_nm,
+                "eta_hours":            eta_hours,
+                "eta_days":             eta_days,
+                "anti_shipping_score":  seg.get("anti_shipping_score", 0),
+                "traffic_avoidance":    seg.get("traffic_avoidance", "unknown"),
+                "safety_flag":          seg.get("safety_flag", "CLEAR"),
                 "routing_constraints": [
                     "avoid:shipping_lanes",
                     "avoid:tss_zones",
@@ -310,16 +403,22 @@ def generate_route_plan_node(state: RouteState) -> RouteState:
     route_plan = {
         "type": "FeatureCollection",
         "metadata": {
-            "expedition_name":        "Berry-Mappemonde",
-            "agent":                  "NAVIGUIDE Route Intelligence Agent v1.0",
-            "framework":              "LangGraph",
-            "calculation_timestamp":  datetime.utcnow().isoformat() + "Z",
-            "algorithm_version":      "1.0.0",
-            "total_distance_nm":      round(total_nm, 1),
-            "total_segments":         len(segments),
+            "expedition_name":         "Berry-Mappemonde",
+            "agent":                   "NAVIGUIDE Route Intelligence Agent v1.0",
+            "framework":               "LangGraph",
+            "calculation_timestamp":   datetime.utcnow().isoformat() + "Z",
+            "algorithm_version":       "1.0.0",
+            "total_distance_nm":       round(total_nm, 1),
+            "total_segments":          len(segments),
             "anti_shipping_avg_score": avg_score,
-            "safety_status":          state.get("status", "unknown"),
-            "route_advisor_notes":    state.get("route_advisor_notes", ""),
+            "safety_status":           state.get("status", "unknown"),
+            "route_advisor_notes":     state.get("route_advisor_notes", ""),
+            # ETA metadata
+            "total_eta_days":          round(total_eta_hours / 24.0, 1),
+            "total_eta_hours":         round(total_eta_hours, 1),
+            "avg_speed_knots_used":    eta_speed,
+            "polar_data_used":         polar_active,
+            "expedition_id":           state.get("expedition_id"),
         },
         "features": features,
     }
@@ -327,8 +426,10 @@ def generate_route_plan_node(state: RouteState) -> RouteState:
     msg = AIMessage(
         content=(
             f"[generate_route_plan] ✅ Route plan complete — "
-            f"{len(segments)} segments | {round(total_nm):,} nm total | "
-            f"anti-shipping avg={avg_score}"
+            f"{len(segments)} segments | {round(total_nm):,} nm | "
+            f"ETA {round(total_eta_hours/24.0, 1)} days "
+            f"@ {eta_speed} kts "
+            f"({'polar VMG' if polar_active else 'vessel default'})"
         )
     )
     return {**state, "route_plan": route_plan, "status": "complete", "messages": [msg]}

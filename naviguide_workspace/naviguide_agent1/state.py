@@ -13,6 +13,11 @@ class RouteState(TypedDict, total=False):
     vessel_specs:         Dict[str, Any]          # vessel performance profile
     constraints:          Dict[str, Any]          # routing constraints
 
+    # Polar performance data (optional — from Polar API)
+    expedition_id:        Optional[str]           # links to polar_data/polar_{id}.json
+    polar_vmg:            Optional[Dict[str, Any]] # VMG summary {tws: {upwind, downwind, gybe_angle}}
+    polar_avg_speed:      Optional[float]         # computed avg boat speed from polars (kts)
+
     # Intermediate — segment computation
     raw_segments:         List[Dict[str, Any]]   # enriched segments with geometry
     anti_shipping_scores: List[float]             # per-segment scores

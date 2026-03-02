@@ -1,9 +1,16 @@
 import os
-from typing import Optional
+import re
+import math
+import json
+import time
+import asyncio
+from typing import Optional, Union, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+import httpx
 import searoute as sr
 from geographiclib.geodesic import Geodesic
 from copernicus.getWind import get_wind_data_at_position
@@ -718,76 +725,650 @@ def get_route(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _sim_wind(lat: float, lon: float) -> dict:
+    """Simulation fallback — field names match frontend expectations exactly."""
+    import random, datetime
+    rng = random.Random(int(abs(lat * 100) + abs(lon * 100)))
+    speed_ms    = rng.uniform(3, 18)
+    speed_kmh   = round(speed_ms * 3.6, 1)
+    speed_knots = round(speed_ms * 1.944, 1)
+    direction   = round(rng.uniform(0, 360), 1)
+    u = round(-speed_ms * math.sin(math.radians(direction)), 3)
+    v = round(-speed_ms * math.cos(math.radians(direction)), 3)
+    return {
+        "latitude": lat, "longitude": lon,
+        "u_component": u, "v_component": v,
+        "wind_speed": round(speed_ms, 2),
+        "wind_speed_kmh": speed_kmh,
+        "wind_speed_knots": speed_knots,
+        "wind_direction": direction,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "simulation": True, "source": "estimated (Copernicus unavailable)",
+    }
+
+def _sim_wave(lat: float, lon: float) -> dict:
+    """Simulation fallback — field names match frontend expectations exactly."""
+    import random, datetime
+    rng = random.Random(int(abs(lat * 137) + abs(lon * 73)))
+    height  = round(rng.uniform(0.3, 4.5), 2)
+    period  = round(rng.uniform(4, 14), 1)
+    direction = round(rng.uniform(0, 360), 1)
+    return {
+        "latitude": lat, "longitude": lon,
+        "significant_wave_height_m": height,   # exact field name frontend expects
+        "mean_wave_period": period,
+        "mean_wave_direction": direction,       # exact field name frontend expects
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "simulation": True, "source": "estimated (Copernicus unavailable)",
+    }
+
+def _sim_current(lat: float, lon: float) -> dict:
+    """Simulation fallback — field names match frontend expectations exactly."""
+    import random, datetime
+    rng = random.Random(int(abs(lat * 211) + abs(lon * 157)))
+    speed_ms    = rng.uniform(0.05, 1.2)
+    speed_knots = round(speed_ms * 1.944, 2)
+    speed_kmh   = round(speed_ms * 3.6, 2)
+    direction   = round(rng.uniform(0, 360), 1)
+    u = round(speed_ms * math.sin(math.radians(direction)), 4)
+    v = round(speed_ms * math.cos(math.radians(direction)), 4)
+    return {
+        "latitude": lat, "longitude": lon,
+        "u_component": u, "v_component": v,
+        "speed_ms": round(speed_ms, 3),
+        "speed_knots": speed_knots,             # exact field name frontend expects
+        "speed_kmh": speed_kmh,                 # exact field name frontend expects
+        "direction_deg": direction,             # exact field name frontend expects
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "simulation": True, "source": "estimated (Copernicus unavailable)",
+    }
+
+
 @app.post("/wind")
 def get_wind(request: PositionRequest):
-    """Récupère les données de vent à une position donnée via Copernicus Marine."""
-    if not COPERNICUS_USERNAME or not COPERNICUS_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="Copernicus credentials not configured"
-        )
+    """Récupère les données de vent via Copernicus Marine, avec fallback simulation."""
     try:
-        wind_data = get_wind_data_at_position(
-            latitude=request.latitude,
-            longitude=request.longitude,
-            username=COPERNICUS_USERNAME,
-            password=COPERNICUS_PASSWORD
-        )
-        if wind_data is None:
-            raise HTTPException(status_code=404, detail="Aucune donnée de vent disponible")
-        return wind_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if COPERNICUS_USERNAME and COPERNICUS_PASSWORD:
+            wind_data = get_wind_data_at_position(
+                latitude=request.latitude,
+                longitude=request.longitude,
+                username=COPERNICUS_USERNAME,
+                password=COPERNICUS_PASSWORD
+            )
+            if wind_data is not None:
+                return wind_data
+    except Exception:
+        pass
+    return _sim_wind(request.latitude, request.longitude)
 
 
 @app.post("/wave")
 def get_wave(request: PositionRequest):
-    """Récupère les données de vague à une position donnée via Copernicus Marine."""
-    if not COPERNICUS_USERNAME or not COPERNICUS_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="Copernicus credentials not configured"
-        )
+    """Récupère les données de vague via Copernicus Marine, avec fallback simulation."""
     try:
-        wave_data = get_wave_data_at_position(
-            latitude=request.latitude,
-            longitude=request.longitude,
-            username=COPERNICUS_USERNAME,
-            password=COPERNICUS_PASSWORD
-        )
-        if wave_data is None:
-            raise HTTPException(status_code=404, detail="Aucune donnée de vague disponible")
-        return wave_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if COPERNICUS_USERNAME and COPERNICUS_PASSWORD:
+            wave_data = get_wave_data_at_position(
+                latitude=request.latitude,
+                longitude=request.longitude,
+                username=COPERNICUS_USERNAME,
+                password=COPERNICUS_PASSWORD
+            )
+            if wave_data is not None:
+                return wave_data
+    except Exception:
+        pass
+    return _sim_wave(request.latitude, request.longitude)
 
 
 @app.post("/current")
 def get_current(request: PositionRequest):
-    """Récupère les données de courant marin de surface via Copernicus Marine."""
-    if not COPERNICUS_USERNAME or not COPERNICUS_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="Copernicus credentials not configured"
-        )
+    """Récupère les données de courant via Copernicus Marine, avec fallback simulation."""
     try:
-        current_data = get_current_data_at_position(
-            latitude=request.latitude,
-            longitude=request.longitude,
-            username=COPERNICUS_USERNAME,
-            password=COPERNICUS_PASSWORD
+        if COPERNICUS_USERNAME and COPERNICUS_PASSWORD:
+            current_data = get_current_data_at_position(
+                latitude=request.latitude,
+                longitude=request.longitude,
+                username=COPERNICUS_USERNAME,
+                password=COPERNICUS_PASSWORD
+            )
+            if current_data is not None:
+                return current_data
+    except Exception:
+        pass
+    return _sim_current(request.latitude, request.longitude)
+
+
+# ── Maritime data proxy routes (CORS bypass) ─────────────────────────────────
+
+# In-memory cache for WPI ports (24 h TTL — data rarely changes)
+_wpi_cache: dict = {"data": None, "ts": 0.0}
+_WPI_CACHE_TTL = 86_400  # seconds
+
+# DMS coordinate pattern: e.g. "30°20'00\"N" or "48°17'00\"E"
+_DMS_RE = re.compile(
+    r"""(\d+)\s*[°d]\s*(\d+)\s*[''′]\s*(\d+(?:\.\d+)?)\s*[""″]?\s*([NSEW]?)""",
+    re.IGNORECASE,
+)
+
+def _parse_coord(value: Optional[Union[str, float, int]]) -> Optional[float]:
+    """
+    Parse a coordinate value that may be decimal or DMS format.
+    Returns float decimal degrees, or None if unparseable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    # Try plain float first
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    # Try DMS
+    m = _DMS_RE.search(s)
+    if m:
+        deg, mins, secs, hemi = m.groups()
+        decimal = float(deg) + float(mins) / 60.0 + float(secs) / 3600.0
+        if hemi.upper() in ("S", "W"):
+            decimal = -decimal
+        return decimal
+    return None
+
+
+@app.get("/proxy/zee", summary="ZEE boundaries proxy (VLIZ WFS)")
+async def proxy_zee(
+    bbox: Optional[str] = Query(
+        None,
+        description="Viewport bounding box as minlon,minlat,maxlon,maxlat (CRS:84)",
+    ),
+    maxFeatures: int = Query(50, ge=1, le=500, description="Max EEZ polygons to return"),
+):
+    """
+    Proxy pour l'API WFS VLIZ Marine Regions — ZEE (Zones Économiques Exclusives).
+    Contourne les restrictions CORS du serveur VLIZ.
+    """
+    params: dict = {
+        "service": "WFS",
+        "version": "1.1.0",
+        "request": "GetFeature",
+        "typeName": "eez",
+        "outputFormat": "application/json",
+        "maxFeatures": maxFeatures,
+    }
+    if bbox:
+        params["bbox"] = bbox
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                "https://geo.vliz.be/geoserver/MarineRegions/wfs",
+                params=params,
+            )
+            resp.raise_for_status()
+            return JSONResponse(content=resp.json())
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"ZEE upstream HTTP error: {exc.response.status_code}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ZEE upstream error: {exc}")
+
+
+@app.get("/proxy/ports", summary="WPI world ports as GeoJSON (NGA/MSI)")
+async def proxy_ports():
+    """
+    Retourne les ports mondiaux du World Port Index (NGA/MSI) en GeoJSON.
+    Résultat mis en cache 24 h côté serveur.
+    """
+    # Serve from cache if still fresh
+    if _wpi_cache["data"] and (time.time() - _wpi_cache["ts"] < _WPI_CACHE_TTL):
+        return JSONResponse(content=_wpi_cache["data"])
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(
+                "https://msi.nga.mil/api/publications/world-port-index",
+                params={"output": "json"},
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"WPI upstream HTTP error: {exc.response.status_code}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"WPI upstream error: {exc}")
+
+    # Normalise: the API may return a list or {"ports": [...]}
+    ports = raw if isinstance(raw, list) else raw.get("ports", [])
+
+    features = []
+    for p in ports:
+        lat = _parse_coord(p.get("latitude") or p.get("lat"))
+        lon = _parse_coord(p.get("longitude") or p.get("lon"))
+        if lat is None or lon is None:
+            continue
+        if lat == 0.0 and lon == 0.0:
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {
+                "name":    p.get("portName")    or p.get("name",    ""),
+                "country": p.get("countryName") or p.get("country", ""),
+                "region":  p.get("regionName")  or p.get("region",  ""),
+                "wpi_num": p.get("portNumber")  or p.get("indexNo", ""),
+            },
+        })
+
+    geojson = {"type": "FeatureCollection", "features": features}
+    _wpi_cache["data"] = geojson
+    _wpi_cache["ts"]   = time.time()
+    return JSONResponse(content=geojson)
+
+
+# NOTE: SHOM WFS /proxy/balisage removed — endpoint requires authentication (401).
+# Balisage is now served client-side via OpenSeaMap raster tiles (no proxy needed).
+
+
+# ── Simulation Mode — Geometry Helpers ───────────────────────────────────────
+
+_DEFAULT_CATAMARAN_SPEED_KTS = 7.5  # conservative offshore sailing speed
+
+
+def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in nautical miles."""
+    R = 3440.065
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi   = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial true bearing from (lat1, lon1) to (lat2, lon2) in degrees [0, 360)."""
+    dlon = math.radians(lon2 - lon1)
+    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
+    x = math.sin(dlon) * math.cos(rlat2)
+    y = math.cos(rlat1) * math.sin(rlat2) - math.sin(rlat1) * math.cos(rlat2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def _snap_to_segment(
+    px: float, py: float,
+    ax: float, ay: float,
+    bx: float, by: float,
+) -> tuple:
+    """
+    Project point P(px=lon, py=lat) onto segment A-B in degree space.
+    Returns (qx, qy, t) where t ∈ [0, 1] is the normalised position along AB.
+    """
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 < 1e-14:
+        return ax, ay, 0.0
+    t = ((px - ax) * dx + (py - ay) * dy) / seg2
+    t = max(0.0, min(1.0, t))
+    return ax + t * dx, ay + t * dy, t
+
+
+def _snap_catamaran_to_route(
+    cat_lat: float,
+    cat_lon: float,
+    route_coords: List[List[float]],
+) -> dict:
+    """
+    Snap the catamaran position to the nearest point on the route polyline.
+    route_coords — [[lon, lat], …] GeoJSON order.
+
+    Returns:
+        snapped_lon, snapped_lat, seg_idx, nm_covered
+    """
+    best_dist      = float("inf")
+    best_lon       = route_coords[0][0]
+    best_lat       = route_coords[0][1]
+    best_seg       = 0
+    best_nm_covered = 0.0
+    cumulative_nm   = 0.0
+
+    for i in range(len(route_coords) - 1):
+        a_lon, a_lat = route_coords[i][0], route_coords[i][1]
+        b_lon, b_lat = route_coords[i + 1][0], route_coords[i + 1][1]
+
+        qlon, qlat, _ = _snap_to_segment(cat_lon, cat_lat, a_lon, a_lat, b_lon, b_lat)
+        dist = _haversine_nm(cat_lat, cat_lon, qlat, qlon)
+
+        if dist < best_dist:
+            best_dist = dist
+            best_lon, best_lat = qlon, qlat
+            best_seg = i
+            best_nm_covered = cumulative_nm + _haversine_nm(a_lat, a_lon, qlat, qlon)
+
+        cumulative_nm += _haversine_nm(a_lat, a_lon, b_lat, b_lon)
+
+    return {
+        "snapped_lon": best_lon,
+        "snapped_lat": best_lat,
+        "seg_idx":     best_seg,
+        "nm_covered":  round(best_nm_covered, 1),
+    }
+
+
+def _find_active_leg(
+    cat_nm_covered: float,
+    route_coords:   List[List[float]],
+    stops:          List[dict],
+) -> dict:
+    """
+    Determine the active stop-to-stop leg and remaining distance to next stop.
+
+    stops — ordered list of {"name": str, "lon": float, "lat": float}
+    Returns from_stop_index, from_stop, to_stop, nm_remaining_to_stop.
+    """
+    # Compute each stop's nm_covered position on the route
+    stop_positions = []
+    for stop in stops:
+        snap = _snap_catamaran_to_route(stop["lat"], stop["lon"], route_coords)
+        stop_positions.append({
+            "name":       stop["name"],
+            "nm_covered": snap["nm_covered"],
+        })
+
+    # Sort by route distance (should already be ordered, but defensive)
+    stop_positions.sort(key=lambda x: x["nm_covered"])
+
+    # Find the active bracket: largest stop before cat, first stop after cat
+    from_idx = 0
+    for i, sp in enumerate(stop_positions):
+        if sp["nm_covered"] <= cat_nm_covered:
+            from_idx = i
+
+    to_idx = min(from_idx + 1, len(stop_positions) - 1)
+
+    from_sp = stop_positions[from_idx]
+    to_sp   = stop_positions[to_idx]
+    nm_remaining = max(0.0, to_sp["nm_covered"] - cat_nm_covered)
+
+    return {
+        "from_stop_index":     from_idx,
+        "from_stop":           from_sp["name"],
+        "to_stop":             to_sp["name"],
+        "nm_remaining_to_stop": round(nm_remaining, 1),
+    }
+
+
+# ── Simulation Mode — Pydantic Models ────────────────────────────────────────
+
+class SimulationStop(BaseModel):
+    name: str
+    lon:  float
+    lat:  float
+
+
+class SimulationPositionRequest(BaseModel):
+    lat:          float
+    lon:          float
+    route_coords: List[List[float]]   # [[lon, lat], …]
+    stops:        List[SimulationStop]
+    speed_kts:    Optional[float] = _DEFAULT_CATAMARAN_SPEED_KTS
+
+
+class AgentRequest(BaseModel):
+    from_stop:    str
+    to_stop:      str
+    lat:          float
+    lon:          float
+    nm_remaining: float
+    language:     str = "fr"
+
+
+# ── Simulation Mode — /simulation/position ───────────────────────────────────
+
+@app.post("/simulation/position", summary="Snap catamaran to route + compute leg metrics")
+def simulation_position(req: SimulationPositionRequest):
+    """
+    Snap the catamaran marker to the nearest point on the route polyline and
+    compute progression metrics for the active leg.
+
+    Returns LegContext: snappedPosition, fromStop, toStop, nmCovered,
+    nmRemainingToStop, etaHours, bearing.
+    """
+    if len(req.route_coords) < 2:
+        raise HTTPException(status_code=400, detail="route_coords must contain at least 2 points")
+    if len(req.stops) < 2:
+        raise HTTPException(status_code=400, detail="stops must contain at least 2 stops")
+
+    # Snap catamaran to route
+    snap = _snap_catamaran_to_route(req.lat, req.lon, req.route_coords)
+
+    # Find active leg
+    stops_list = [{"name": s.name, "lon": s.lon, "lat": s.lat} for s in req.stops]
+    leg        = _find_active_leg(snap["nm_covered"], req.route_coords, stops_list)
+
+    # Bearing at the active segment
+    seg_idx = min(snap["seg_idx"], len(req.route_coords) - 2)
+    a_lon, a_lat = req.route_coords[seg_idx][0], req.route_coords[seg_idx][1]
+    b_lon, b_lat = req.route_coords[seg_idx + 1][0], req.route_coords[seg_idx + 1][1]
+    bearing = round(_bearing_deg(a_lat, a_lon, b_lat, b_lon), 1)
+
+    # ETA to next stop
+    speed    = req.speed_kts if req.speed_kts and req.speed_kts > 0 else _DEFAULT_CATAMARAN_SPEED_KTS
+    eta_hours = round(leg["nm_remaining_to_stop"] / speed, 1)
+
+    return {
+        "fromStopIndex":     leg["from_stop_index"],
+        "fromStop":          leg["from_stop"],
+        "toStop":            leg["to_stop"],
+        "nmCovered":         snap["nm_covered"],
+        "nmRemainingToStop": leg["nm_remaining_to_stop"],
+        "etaHours":          eta_hours,
+        "bearing":           bearing,
+        "snappedPosition":   [snap["snapped_lon"], snap["snapped_lat"]],
+    }
+
+
+# ── Simulation Mode — Agent Endpoints ────────────────────────────────────────
+# All 4 agents stream token-by-token via Anthropic SSE for progressive display
+# in the frontend AgentPanel. Each endpoint:
+#   1. Runs the agent's data-fetch pipeline synchronously (in threadpool)
+#   2. Builds the LLM prompt from the fetched context
+#   3. Streams Anthropic tokens as SSE  data: {"token": "..."}  events
+#   4. Terminates with  data: [DONE]
+
+
+@app.post("/agents/custom", summary="Agent Custom — Port & Customs Intelligence (SSE)")
+async def agent_custom(req: AgentRequest):
+    """
+    Invoke the Custom LangGraph agent for port entry intelligence.
+    Streams token-by-token as SSE data: {"token": "..."} events.
+    """
+    async def generator():
+        from agents.custom_agent import get_streaming_prompt
+        from agents.deploy_ai import stream_llm
+
+        # Build prompt (sync — no I/O, runs in current thread)
+        prompt = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: get_streaming_prompt(
+                from_stop=req.from_stop,
+                to_stop=req.to_stop,
+                lat=req.lat,
+                lon=req.lon,
+                nm_remaining=req.nm_remaining,
+                language=req.language,
+            ),
         )
-        if current_data is None:
-            raise HTTPException(status_code=404, detail="Aucune donnée de courant disponible")
-        return current_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+        has_content = False
+        try:
+            async for token in stream_llm(prompt):
+                if token:
+                    has_content = True
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+        except Exception:
+            pass
+
+        if not has_content:
+            fallback = (
+                f"## {req.to_stop} — Port Intelligence\n\n"
+                f"⚠️ **LLM service temporarily unavailable.**\n\n"
+                f"**Recommended resources:**\n"
+                f"- 🌐 [Noonsite](https://www.noonsite.com) — search for {req.to_stop}\n"
+                f"- 📖 Local pilot charts & sailing almanac\n"
+                f"- 📡 VHF Ch 16 → harbour authority on arrival\n\n"
+                f"Distance remaining: **{req.nm_remaining:.0f} nm**."
+            )
+            yield f"data: {json.dumps({'token': fallback})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+@app.post("/agents/guard", summary="Agent Guard — Maritime Security (SSE)")
+async def agent_guard(req: AgentRequest):
+    """
+    Invoke the Guard LangGraph agent for maritime security intelligence.
+    Streams token-by-token as SSE data: {"token": "..."} events.
+    Includes live IMB piracy-data fetch before streaming LLM output.
+    """
+    async def generator():
+        from agents.guard_agent import get_streaming_prompt
+        from agents.deploy_ai import stream_llm
+
+        # Build prompt — includes live IMB piracy-data fetch (sync, in threadpool)
+        prompt = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: get_streaming_prompt(
+                from_stop=req.from_stop,
+                to_stop=req.to_stop,
+                lat=req.lat,
+                lon=req.lon,
+                nm_remaining=req.nm_remaining,
+                language=req.language,
+            ),
+        )
+
+        has_content = False
+        try:
+            async for token in stream_llm(prompt):
+                if token:
+                    has_content = True
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+        except Exception:
+            pass
+
+        if not has_content:
+            fallback = (
+                f"## {req.to_stop} — Maritime Security\n\n"
+                f"⚠️ **LLM service temporarily unavailable.**\n\n"
+                f"**Recommended resources:**\n"
+                f"- 🌐 [IMB Piracy Reporting Centre](https://www.icc-ccs.org/piracy-reporting-centre)\n"
+                f"- 📡 VHF Ch 16 on arrival\n\n"
+                f"Distance remaining: **{req.nm_remaining:.0f} nm**."
+            )
+            yield f"data: {json.dumps({'token': fallback})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+@app.post("/agents/meteo", summary="Agent Meteo — Weather & Routing Windows (SSE)")
+async def agent_meteo(req: AgentRequest):
+    """
+    Invoke the Meteo LangGraph agent for weather and routing windows.
+    Streams token-by-token as SSE data: {"token": "..."} events.
+    Includes StormGlass weather fetch before streaming LLM output.
+    """
+    async def generator():
+        from agents.meteo_agent import get_streaming_prompt
+        from agents.deploy_ai import stream_llm
+
+        # Build prompt — includes StormGlass weather fetch (sync, in threadpool)
+        prompt = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: get_streaming_prompt(
+                from_stop=req.from_stop,
+                to_stop=req.to_stop,
+                lat=req.lat,
+                lon=req.lon,
+                nm_remaining=req.nm_remaining,
+                language=req.language,
+            ),
+        )
+
+        has_content = False
+        try:
+            async for token in stream_llm(prompt):
+                if token:
+                    has_content = True
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+        except Exception:
+            pass
+
+        if not has_content:
+            fallback = (
+                f"## {req.to_stop} — Weather Briefing\n\n"
+                f"⚠️ **LLM service temporarily unavailable.**\n\n"
+                f"**Recommended resources:**\n"
+                f"- 🌐 [Windy](https://www.windy.com) — real-time weather\n"
+                f"- 📡 NavTex / SSB weatherfax\n\n"
+                f"Distance remaining: **{req.nm_remaining:.0f} nm**."
+            )
+            yield f"data: {json.dumps({'token': fallback})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+@app.post("/agents/pirate", summary="Agent Pirate — Community Intelligence (SSE)")
+async def agent_pirate(req: AgentRequest):
+    """
+    Invoke the Pirate LangGraph agent for cruiser community intelligence.
+    Streams token-by-token as SSE data: {"token": "..."} events.
+    Includes Noonsite RSS fetch before streaming LLM output.
+    """
+    async def generator():
+        from agents.pirate_agent import get_streaming_prompt
+        from agents.deploy_ai import stream_llm
+
+        # Build prompt — includes Noonsite RSS fetch (sync, in threadpool)
+        prompt = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: get_streaming_prompt(
+                from_stop=req.from_stop,
+                to_stop=req.to_stop,
+                lat=req.lat,
+                lon=req.lon,
+                nm_remaining=req.nm_remaining,
+                language=req.language,
+            ),
+        )
+
+        has_content = False
+        try:
+            async for token in stream_llm(prompt):
+                if token:
+                    has_content = True
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+        except Exception:
+            pass
+
+        if not has_content:
+            fallback = (
+                f"## {req.to_stop} — Community Intelligence\n\n"
+                f"⚠️ **LLM service temporarily unavailable.**\n\n"
+                f"**Recommended resources:**\n"
+                f"- 🌐 [Noonsite Forums](https://www.noonsite.com)\n"
+                f"- 🌐 [Cruisers Forum](https://www.cruisersforum.com)\n\n"
+                f"Distance remaining: **{req.nm_remaining:.0f} nm**."
+            )
+            yield f"data: {json.dumps({'token': fallback})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
