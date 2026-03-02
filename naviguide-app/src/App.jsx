@@ -491,6 +491,23 @@ export default function App() {
       to: byName("Saint-Pierre (Saint-Pierre-et-Miquelon)"),
     });
 
+    // ── Segment direction guard ──────────────────────────────────────────────
+    // searoute may return coords in either direction (A→B or B→A).
+    // Ensure the polyline always runs from leg.from → leg.to so that the
+    // bearing calculation (A→B on each sub-segment) points the right way.
+    const sqDist = (coord, point) => {
+      const dLon = coord[0] - point.lon;
+      const dLat = coord[1] - point.lat;
+      return dLon * dLon + dLat * dLat;
+    };
+    const orientCoords = (coords, from, to) => {
+      if (!coords || coords.length < 2) return coords;
+      // If coords[0] is closer to `to` than to `from`, the array is reversed
+      return sqDist(coords[0], to) < sqDist(coords[0], from)
+        ? [...coords].reverse()
+        : coords;
+    };
+
     const fetchLeg = async (leg) => {
       const legKey = `${leg.from.name}|${leg.to.name}`;
       const isNonMaritime = nonMaritimeNames.has(legKey);
@@ -530,7 +547,7 @@ export default function App() {
           if (routeFeature.geometry && routeFeature.geometry.coordinates) {
             return {
               ...leg,
-              coords: routeFeature.geometry.coordinates,
+              coords: orientCoords(routeFeature.geometry.coordinates, leg.from, leg.to),
               windPoints,
               wavePoints,
               currentPoints, // 👈 Et on les ajoute ici
@@ -540,7 +557,7 @@ export default function App() {
         } else if (data.geometry && data.geometry.coordinates) {
           return {
             ...leg,
-            coords: data.geometry.coordinates,
+            coords: orientCoords(data.geometry.coordinates, leg.from, leg.to),
             windPoints: [],
             wavePoints: [],
             nonMaritime: false,
