@@ -33,11 +33,20 @@ function PolarChatSection({ polarData }) {
   const [messages,    setMessages]    = useState([]);
   const [chatInput,   setChatInput]   = useState("");
   const [chatLoading, setChatLoading] = useState(false);
-  const chatEndRef                    = useRef(null);
+  const chatEndRef  = useRef(null);
+  const textareaRef = useRef(null);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Auto-resize textarea as content grows/shrinks
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 112) + "px";
+  }, [chatInput]);
 
   const handleSend = async () => {
     const msg = chatInput.trim();
@@ -100,6 +109,7 @@ function PolarChatSection({ polarData }) {
         {/* Input */}
         <div className="border-t border-slate-700/50 px-3 py-2 flex gap-2 items-end">
           <textarea
+            ref={textareaRef}
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -107,7 +117,8 @@ function PolarChatSection({ polarData }) {
             disabled={!polarData}
             rows={1}
             className="flex-1 bg-transparent text-xs text-white placeholder-slate-500 resize-none
-              focus:outline-none leading-relaxed disabled:opacity-40"
+              focus:outline-none leading-relaxed disabled:opacity-40 overflow-y-auto"
+            style={{ maxHeight: "112px" }}
           />
           <button
             onClick={handleSend}
