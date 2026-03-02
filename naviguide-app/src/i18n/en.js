@@ -118,4 +118,30 @@ export default {
   exported:         "Exported!",
   exportGeoJSON:    "Export GeoJSON",
   exportKML:        "Export KML",
+
+  // ── Polar upload (ExportSidebar) ───────────────────────────────────────────
+  polarSection:           "Polars",
+  polarDropZone:          "Drop a polar file here",
+  polarFormats:           "PDF · CSV · XLSX",
+  polarAnalyzing:         "Analyzing…",
+  polarLoaded:            "Polars loaded",
+  polarFailed:            "Failed",
+  polarUploadErrorPrefix: "Failed",
+  polarUpwind:            "↑ Upwind",
+  polarDownwind:          "↓ Downwind",
+
+  // ── Polar Chat (Sidebar) ───────────────────────────────────────────────────
+  polarChatLoadPrompt:     "Load polars (right panel) to enable chat.",
+  polarChatAskPlaceholder: "Ask about polars…",
+  polarChatLoadFirst:      "Load polars first",
+
+  // ── Simulation button (Sidebar) ────────────────────────────────────────────
+  simulationModeLabel:   "Simulation Mode",
+  exitSimulationShort:   "Exit simulation",
+  simulationModeTooltip: "Simulation Mode — drag the catamaran along the route",
+
+  // ── Advance button (SimulationPanel) ──────────────────────────────────────
+  advanceToNextPoint:  "Advance to next point",
+  advanceNextSegTitle: "Advance to midpoint of next segment",
+  endOfRoute:          "End of route reached",
 };

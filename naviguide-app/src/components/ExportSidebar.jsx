@@ -18,10 +18,11 @@ function kts(v) { return v != null ? `${Number(v).toFixed(1)} kt` : "—"; }
 function deg(v) { return v != null ? `${Math.round(v)}°`          : "—"; }
 
 function PolarStatusBadge({ status, detail }) {
+  const { t } = useLang();
   const cfg = {
-    uploading: { icon: <Loader2 size={12} className="animate-spin" />, color: "text-blue-400",  bg: "bg-blue-900/30",  text: "Analyse…" },
-    success:   { icon: <CheckCircle2 size={12} />,                     color: "text-green-400", bg: "bg-green-900/30", text: "Polaires chargées" },
-    error:     { icon: <TriangleAlert size={12} />,                    color: "text-red-400",   bg: "bg-red-900/30",   text: "Échec" },
+    uploading: { icon: <Loader2 size={12} className="animate-spin" />, color: "text-blue-400",  bg: "bg-blue-900/30",  text: t("polarAnalyzing") },
+    success:   { icon: <CheckCircle2 size={12} />,                     color: "text-green-400", bg: "bg-green-900/30", text: t("polarLoaded") },
+    error:     { icon: <TriangleAlert size={12} />,                    color: "text-red-400",   bg: "bg-red-900/30",   text: t("polarFailed") },
   };
   if (!status) return null;
   const c = cfg[status] ?? cfg.error;
@@ -469,7 +470,7 @@ export function ExportSidebar({
           <div className="pt-2 border-t border-slate-700/60 mt-2 space-y-3">
             <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
               <Compass size={11} className="text-blue-400" />
-              Polaires
+              {t("polarSection")}
             </div>
 
             {/* Drop zone */}
@@ -507,14 +508,14 @@ export function ExportSidebar({
               {polarFile
                 ? <span className="text-xs font-medium text-green-300 text-center break-all">{polarFile.name}</span>
                 : <>
-                    <span className="text-xs text-slate-400">Glissez un fichier polaire</span>
-                    <span className="text-xs text-slate-600">PDF · CSV · XLSX</span>
+                    <span className="text-xs text-slate-400">{t("polarDropZone")}</span>
+                    <span className="text-xs text-slate-600">{t("polarFormats")}</span>
                   </>
               }
             </div>
 
             {polarUploadStatus === "error" && (
-              <p className="text-xs text-red-400 px-1">Échec — {polarUploadDetail}</p>
+              <p className="text-xs text-red-400 px-1">{t("polarUploadErrorPrefix")} — {polarUploadDetail}</p>
             )}
 
             {/* VMG table */}
@@ -526,8 +527,8 @@ export function ExportSidebar({
                       <th rowSpan={2} className="py-1.5 px-1.5 text-center text-blue-300 font-bold align-middle text-xs">
                         TWS<br /><span className="text-slate-500 font-normal">kt</span>
                       </th>
-                      <th colSpan={3} className="py-1 px-1 text-center text-green-400 font-semibold text-xs border-r border-slate-700/40">↑ Près</th>
-                      <th colSpan={3} className="py-1 px-1 text-center text-amber-400 font-semibold text-xs">↓ Portant</th>
+                      <th colSpan={3} className="py-1 px-1 text-center text-green-400 font-semibold text-xs border-r border-slate-700/40">{t("polarUpwind")}</th>
+                      <th colSpan={3} className="py-1 px-1 text-center text-amber-400 font-semibold text-xs">{t("polarDownwind")}</th>
                     </tr>
                     <tr className="bg-slate-800/60 border-b border-slate-700/60">
                       {["TWA","BS","VMG","TWA","BS","VMG"].map((h, i) => (
