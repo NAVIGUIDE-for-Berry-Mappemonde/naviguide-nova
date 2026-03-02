@@ -201,10 +201,15 @@ export function useLegContext(
     }
 
     // ── 6. Bearing (cap) ─────────────────────────────────────────────────────
+    // Use the SEGMENT direction (A→B endpoints) rather than snap→nextVertex.
+    // Using snap→nextVertex causes bearing=atan2(0,0)=0° (north) whenever
+    // the snap position coincides with the next vertex (e.g. t=1 at segment
+    // end, or near-duplicate vertices like the Cap Corse routing artefact).
     let bearing = 0;
     if (bestSegIdx < polyline.length - 1) {
-      const [nLon, nLat] = polyline[Math.min(bestSegIdx + 1, polyline.length - 1)];
-      bearing = initialBearing(snapLat, snapLon, nLat, nLon);
+      const [aLon, aLat] = polyline[bestSegIdx];
+      const [bLon, bLat] = polyline[bestSegIdx + 1];
+      bearing = initialBearing(aLat, aLon, bLat, bLon);
     }
 
     // ── 7. ETA ───────────────────────────────────────────────────────────────
