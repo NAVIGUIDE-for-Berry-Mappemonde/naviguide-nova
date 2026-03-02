@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,578 +6,32 @@ from pydantic import BaseModel
 import searoute as sr
 from geographiclib.geodesic import Geodesic
 from copernicus.getWind import get_wind_data_at_position
-from copernicus.getWave import get_wave_data_at_position
-from copernicus.getCurrent import get_current_data_at_position
 from utils.addWindProperties import add_wind_properties_to_route
 
-try:
-    from global_land_mask import globe as _globe
-    _LAND_MASK_AVAILABLE = True
-except ImportError:
-    _globe = None
-    _LAND_MASK_AVAILABLE = False
+# NOTE: FastAPI n'utilise PAS request et jsonify (qui sont de Flask)
+# FastAPI gère automatiquement le JSON via Pydantic
 
-# ── High-resolution land mask (Natural Earth 1:10m + minor islands) ───────────
-import pathlib, shapely.geometry, shapely.strtree
-
-_NE_TREE: Optional[shapely.strtree.STRtree] = None
-
-def _load_ne_land_tree() -> Optional[shapely.strtree.STRtree]:
-    """
-    Load Natural Earth 1:10m land + minor-islands shapefiles and build an
-    STRtree for fast point-in-polygon queries.  Returns None on failure.
-    """
-    try:
-        import shapefile as pyshp
-        geo_dir = pathlib.Path(__file__).parent / "geo_data"
-        polys: list = []
-        for fname in ("ne_10m_land.shp", "ne_10m_minor_islands.shp"):
-            shp = geo_dir / fname
-            if not shp.exists():
-                continue
-            sf = pyshp.Reader(str(shp))
-            for shape in sf.shapes():
-                geo = shapely.geometry.shape(shape.__geo_interface__)
-                if geo.geom_type == "Polygon":
-                    if geo.is_valid and not geo.is_empty:
-                        polys.append(geo)
-                elif geo.geom_type == "MultiPolygon":
-                    for sub in geo.geoms:
-                        if sub.is_valid and not sub.is_empty:
-                            polys.append(sub)
-        if polys:
-            print(f"✅ NE land mask loaded: {len(polys)} polygons")
-            return shapely.strtree.STRtree(polys)
-    except Exception as exc:
-        print(f"⚠️  NE land mask unavailable: {exc}")
-    return None
-
-_NE_TREE = _load_ne_land_tree()
-
-
-def _is_land_hires(lat: float, lon: float) -> bool:
-    """
-    Combined high-resolution land check:
-    1. global_land_mask (1/4° grid, very fast) — catches continents/large islands
-    2. Natural Earth 1:10m STRtree — catches smaller islands (Nias, Mentawai…)
-    Returns True if EITHER source classifies the point as land.
-    """
-    # Primary: fast 1/4° grid check
-    if _LAND_MASK_AVAILABLE:
-        try:
-            if bool(_globe.is_land(lat, lon)):
-                return True
-        except Exception:
-            pass
-    # Secondary: high-resolution shapely tree for small islands
-    if _NE_TREE is not None:
-        pt = shapely.geometry.Point(lon, lat)
-        return len(_NE_TREE.query(pt, predicate="intersects")) > 0
-    return False
-
-# Charger les variables d'environnement
+# Charger les variables d'environnement depuis le fichier .env
 load_dotenv()
 
+# Récupérer les identifiants Copernicus depuis les variables d'environnement
 COPERNICUS_USERNAME = os.getenv("COPERNICUS_USERNAME")
 COPERNICUS_PASSWORD = os.getenv("COPERNICUS_PASSWORD")
 
+# Vérifier que les identifiants sont bien définis
+import logging
 if not COPERNICUS_USERNAME or not COPERNICUS_PASSWORD:
-    print("⚠️  WARNING: Copernicus credentials not set. Wind/wave data will be unavailable.")
-else:
-    print(f"✅ Copernicus configured for user: {COPERNICUS_USERNAME}")
-
-
-# ── Land-waypoint sanitiser ───────────────────────────────────────────────────
-
-def _has_nearby_ocean(lat: float, lon: float, radius_deg: float = 1.5) -> bool:
-    """
-    Return True if there is at least one ocean cell within *radius_deg* of
-    (lat, lon). Used to distinguish genuine inland waypoints from narrow
-    maritime passages like the Suez Canal, where global_land_mask at 1/4°
-    incorrectly labels every canal cell as land even though the point is a
-    valid maritime route node.
-    """
-    if not _LAND_MASK_AVAILABLE:
-        return True   # no mask available → assume navigable
-    steps = [-radius_deg, -radius_deg * 0.5, 0.0, radius_deg * 0.5, radius_deg]
-    for dlat in steps:
-        for dlon in steps:
-            try:
-                if not _globe.is_land(lat + dlat, lon + dlon):
-                    return True
-            except Exception:
-                pass
-    return False
-
-
-def _segment_crosses_land(lon1: float, lat1: float, lon2: float, lat2: float,
-                          n_samples: int = 30) -> bool:
-    """
-    Return True if the great-circle segment from (lon1,lat1)→(lon2,lat2)
-    crosses any land, including small islands and archipelagos.
-
-    Uses the combined high-resolution check (_is_land_hires) which queries
-    both global_land_mask (1/4° grid) and the Natural Earth 1:10m STRtree,
-    so islands like Nias and the Mentawai group are reliably detected.
-    Dense sampling (30 pts) catches features as narrow as ~20 km.
-
-    Antimeridian segments (|Δlon| > 180°) are never re-routed: they were
-    already computed by searoute across the ±180° boundary and are correct.
-    Re-sampling them in lon space produces bogus midpoints that span the
-    globe, so we skip the land check entirely for these segments.
-    """
-    if not _LAND_MASK_AVAILABLE and _NE_TREE is None:
-        return False
-    # Guard 1 — antimeridian: searoute already routed the segment correctly;
-    # geodesic sampling across ±180° produces bogus mid-globe land hits.
-    if abs(lon2 - lon1) > 180:
-        return False
-    geod = Geodesic.WGS84
-    try:
-        line = geod.InverseLine(lat1, lon1, lat2, lon2)
-        total_dist = line.s13
-    except Exception:
-        return False
-
-    if total_dist < 1000:             # < 1 km — skip micro-segments (canal links)
-        return False
-
-    # Guard 2 — canal / passage endpoints: if either endpoint is on land AND
-    # the segment is short (≤ 20 km), trust searoute's canal / strait routing.
-    # Panama Canal, Suez Canal and all navigable straits are < 20 km per segment.
-    # Segments longer than 20 km are checked even when an endpoint is on an island,
-    # so that island-to-island routes don't cross intermediate landmasses silently.
-    if total_dist <= 20_000 and (_is_land_hires(lat1, lon1) or _is_land_hires(lat2, lon2)):
-        return False
-
-    try:
-        # When an endpoint is on an island/harbour, skip samples near that endpoint
-        # to avoid false positives caused by the urban/coastal land mass surrounding
-        # a port (e.g. Pointe-à-Pitre, Fort-de-France).  We skip the last 25 % of
-        # samples so that real crossings further back along the segment are still
-        # caught, while short "harbour approach" land hits are ignored.
-        start_k = 3 if _is_land_hires(lat1, lon1) else 1
-        end_k   = (n_samples * 3 // 4) if _is_land_hires(lat2, lon2) else n_samples
-
-        # Require at least 2 *consecutive* land samples before reporting a crossing.
-        # A single land sample on a ~75 km segment corresponds to a ~1–2 km island
-        # or reef (e.g. Torres Strait cays, Maldive atolls) whose geodesic clip is a
-        # false positive — searoute already routes around such obstacles correctly.
-        # Real land masses (Basse-Terre ~30 km, Nias ~130 km, continents) produce
-        # many consecutive samples and are still reliably detected.
-        consecutive = 0
-        for k in range(start_k, end_k):
-            pos = line.Position(k / n_samples * total_dist)
-            if _is_land_hires(pos["lat2"], pos["lon2"]):
-                consecutive += 1
-                if consecutive >= 2:
-                    return True       # confirmed crossing: ≥ 2 consecutive land samples
-            else:
-                consecutive = 0      # reset on any ocean sample
-    except Exception:
-        pass
-    return False
-
-
-def _normalize_antimeridian(coords: list, prev_lon: float) -> list:
-    """
-    Walk through a list of [lon, lat] waypoints and adjust each longitude so
-    that the sequence is continuous — no ±180° jumps.  This mirrors the same
-    correction applied inside `_densify_coords` and is required whenever new
-    waypoints are inserted by `searoute` or by a perpendicular detour, because
-    those paths do not go through the densifier.
-
-    `prev_lon` is the longitude of the last already-accepted waypoint (the
-    point that precedes the first element of `coords`).
-    Returns a NEW list with corrected longitudes (input is not mutated).
-    """
-    result = []
-    for pt in coords:
-        lon, lat = pt[0], pt[1]
-        if lon - prev_lon > 180:
-            lon -= 360
-        elif lon - prev_lon < -180:
-            lon += 360
-        result.append([lon, lat])
-        prev_lon = lon
-    return result
-
-
-def _reroute_segment(a: list, b: list) -> list:
-    """
-    Try to replace a land-crossing direct segment [a→b] with a proper
-    maritime sub-route from searoute.
-    Returns a list of [lon, lat] points that follow 'a' (i.e. does NOT
-    include 'a' itself, DOES include 'b').
-    Falls back to [b] (direct hop) when searoute also fails.
-    """
-    try:
-        sub = sr.searoute((a[0], a[1]), (b[0], b[1]))
-        if sub and sub.get("geometry", {}).get("coordinates"):
-            sub_coords = sub["geometry"]["coordinates"]
-            # Only use searoute result if it contains at least one intermediate
-            # waypoint (> 2 points).  When searoute returns just [A, B] it means
-            # it has no better route — fall through to perpendicular-offset strategy.
-            if len(sub_coords) > 2:
-                # Normalize antimeridian continuity relative to point 'a'
-                normalized = _normalize_antimeridian(sub_coords[1:], a[0])
-                return normalized    # exclude 'a' — already in result
-    except Exception:
-        pass
-    return [b]   # fallback: direct connection (still not ideal, but keeps route valid)
-
-
-def _fix_land_crossing_segments(coords: list) -> list:
-    """
-    Walk through consecutive waypoint pairs.  For any segment that crosses
-    deeply-inland land, replace it with a maritime sub-route obtained from
-    searoute.  Non-crossing segments are kept as-is for performance.
-    """
-    if not _LAND_MASK_AVAILABLE or len(coords) < 2:
-        return coords
-
-    result = [coords[0]]
-
-    for i in range(len(coords) - 1):
-        a = result[-1]        # last accepted/inserted point
-        b = coords[i + 1]
-
-        if _segment_crosses_land(a[0], a[1], b[0], b[1]):
-            replacement = _reroute_segment(a, b)
-            result.extend(replacement)
-        else:
-            result.append(b)
-
-    return result
-
-
-def _find_land_crossing_detour(a: list, b: list) -> list:
-    """
-    Given a segment A→B known to cross land, return a replacement list of
-    waypoints (excluding A, including B) that navigates around the land.
-
-    Tries in order:
-      1. searoute(A, B)  — precomputed maritime routing graph
-      2. Perpendicular-offset midpoint at 50 / 100 / 150 / 200 km on each
-         side, evaluated at fractions 0.5 / 0.33 / 0.67 along the segment.
-         The first candidate whose two sub-segments are both land-free is used.
-
-    Falls back to [B] (direct hop) if every strategy fails.
-    """
-    # Strategy 1: maritime routing library
-    geod = Geodesic.WGS84
-    try:
-        sub = sr.searoute((a[0], a[1]), (b[0], b[1]))
-        if sub and sub.get("geometry", {}).get("coordinates"):
-            sub_coords = sub["geometry"]["coordinates"]
-            # Only accept if searoute added at least one INTERMEDIATE waypoint
-            # (> 2 points = start + intermediate(s) + end).  When it returns
-            # just [A, B] it found no better route — fall through to Strategy 2.
-            if len(sub_coords) > 2:
-                # Sanity check: reject spurious circumnavigations.
-                # searoute's graph can produce absurd round-trip detours (e.g.
-                # Torres Strait region: a 70 km or even 400 km direct segment
-                # routed via a 2 000 km Coral Sea loop).  The per-point check
-                # (distance from each intermediate to both endpoints) can miss
-                # cases where the segment is long enough that a circumnavigation
-                # intermediate lies within 3× of one endpoint.
-                #
-                # Primary check — total route length vs direct distance:
-                # if the sum of all sub-segment distances exceeds 3× the direct
-                # A→B distance the result is a circumnavigation, not a reroute.
-                direct_dist = geod.Inverse(a[1], a[0], b[1], b[0])["s12"]
-                total_route = sum(
-                    geod.Inverse(
-                        sub_coords[k][1], sub_coords[k][0],
-                        sub_coords[k + 1][1], sub_coords[k + 1][0]
-                    )["s12"]
-                    for k in range(len(sub_coords) - 1)
-                )
-                if total_route <= direct_dist * 3:
-                    # Normalize antimeridian continuity relative to point 'a'
-                    normalized = _normalize_antimeridian(sub_coords[1:], a[0])
-                    return normalized
-    except Exception:
-        pass
-
-    # Strategy 2: perpendicular-offset midpoint detour
-    geod = Geodesic.WGS84
-    try:
-        inv = geod.Inverse(a[1], a[0], b[1], b[0])
-        bearing = inv["azi1"]
-        dist = inv["s12"]
-        mid_line = geod.InverseLine(a[1], a[0], b[1], b[0])
-
-        # Adaptive offset distances: use finer steps for short segments so the
-        # detour stays close enough to navigate narrow island channels/passages
-        # (e.g. the approach to Pointe-à-Pitre around Basse-Terre, ~32km).
-        if dist < 100_000:
-            detour_distances_km = [10, 20, 30, 50]
-        else:
-            detour_distances_km = [50, 100, 150, 200]
-
-        for frac in [0.5, 0.33, 0.67]:
-            mid_pos = mid_line.Position(frac * dist)
-            mid_lat, mid_lon = mid_pos["lat2"], mid_pos["lon2"]
-
-            for sign in [1, -1]:          # try both sides of the segment
-                for detour_km in detour_distances_km:
-                    p = geod.Direct(
-                        mid_lat, mid_lon,
-                        (bearing + sign * 90) % 360,
-                        detour_km * 1000
-                    )
-                    wp = [p["lon2"], p["lat2"]]
-                    # Normalize the detour waypoint longitude for continuity
-                    wp = _normalize_antimeridian([wp], a[0])[0]
-                    if _is_land_hires(wp[1], wp[0]):
-                        continue          # detour point itself is on land
-                    seg1_ok = not _segment_crosses_land(a[0], a[1], wp[0], wp[1])
-                    seg2_ok = not _segment_crosses_land(wp[0], wp[1], b[0], b[1])
-                    if seg1_ok and seg2_ok:
-                        # Also normalize b relative to the detour waypoint
-                        b_norm = _normalize_antimeridian([b], wp[0])[0]
-                        return [wp, b_norm]    # clean two-leg detour found
-    except Exception:
-        pass
-
-    return [b]   # last-resort direct hop
-
-
-def avoid_land(coords: list, max_iterations: int = 8) -> list:
-    """
-    Iteratively scan every consecutive segment in the route and reroute
-    any that cross land, until the route is fully clean or max_iterations
-    is reached.
-
-    This is the core "Avoid Land" function: it guarantees that the rendered
-    polyline never crosses a landmass or island as long as a detour can be
-    found within the search parameters of _find_land_crossing_detour.
-    """
-    if not _LAND_MASK_AVAILABLE and _NE_TREE is None:
-        return coords
-
-    for iteration in range(max_iterations):
-        changed = False
-        result = [coords[0]]
-
-        for i in range(len(coords) - 1):
-            a = result[-1]
-            b = coords[i + 1]
-
-            if _segment_crosses_land(a[0], a[1], b[0], b[1]):
-                detour = _find_land_crossing_detour(a, b)
-                result.extend(detour)
-                changed = True
-            else:
-                result.append(b)
-
-        coords = result
-        if not changed:
-            print(f"✅ avoid_land: clean after {iteration + 1} iteration(s), {len(coords)} waypoints")
-            break
-    else:
-        print(f"⚠️  avoid_land: max_iterations={max_iterations} reached, {len(coords)} waypoints")
-
-    return coords
-
-
-def _snap_to_ocean(lat: float, lon: float, max_radius_deg: float = 1.5) -> Optional[list]:
-    """
-    Given a point classified as land, find and return the nearest ocean cell
-    whose centre lies STRICTLY within max_radius_deg of (lat, lon), using
-    the 1/4° grid spacing of global_land_mask.
-
-    Returns [lon, lat] of the nearest qualifying ocean cell, or None.
-    """
-    if not _LAND_MASK_AVAILABLE:
-        return [lon, lat]
-
-    grid = 0.25   # 1/4° matches global_land_mask resolution
-    steps = int(max_radius_deg / grid) + 1
-    max_sq = max_radius_deg ** 2        # strict radius² cut-off
-    best_pt: Optional[list] = None
-    best_dist_sq = float("inf")
-
-    for di in range(-steps, steps + 1):
-        for dj in range(-steps, steps + 1):
-            dist_sq = (di * grid) ** 2 + (dj * grid) ** 2
-            if dist_sq > max_sq:
-                continue   # outside the requested radius
-            if dist_sq >= best_dist_sq:
-                continue   # already have a closer candidate
-            try:
-                tlat = lat + di * grid
-                tlon = lon + dj * grid
-                if not _globe.is_land(tlat, tlon):
-                    best_pt = [tlon, tlat]
-                    best_dist_sq = dist_sq
-            except Exception:
-                pass
-
-    return best_pt
-
-
-def _snap_to_ocean_fine(lat: float, lon: float,
-                         radius_deg: float = 0.15,
-                         grid: float = 0.01) -> Optional[list]:
-    """
-    High-resolution version of _snap_to_ocean.
-
-    Searches for the nearest ocean point within *radius_deg* of (lat, lon)
-    using a fine *grid* step (default 0.01° ≈ 1 km).  Uses the combined
-    high-resolution land check (_is_land_hires) — Natural Earth 1:10m +
-    global_land_mask — so it correctly resolves small-island harbours and
-    narrow channels that the coarse 1/4° grid misses.
-
-    Returns [lon, lat] of the closest water cell, or None if none found.
-    """
-    geod = Geodesic.WGS84
-    steps = int(radius_deg / grid) + 1
-    max_sq = radius_deg ** 2
-
-    best_pt: Optional[list] = None
-    best_dist_m = float("inf")
-
-    for di in range(-steps, steps + 1):
-        for dj in range(-steps, steps + 1):
-            dist_sq = (di * grid) ** 2 + (dj * grid) ** 2
-            if dist_sq > max_sq:
-                continue                      # outside search radius
-            tlat = lat + di * grid
-            tlon = lon + dj * grid
-            if _is_land_hires(tlat, tlon):
-                continue                      # still on land
-            dist_m = geod.Inverse(lat, lon, tlat, tlon)["s12"]
-            if dist_m < best_dist_m:
-                best_dist_m = dist_m
-                best_pt = [tlon, tlat]
-
-    return best_pt
-
-
-def _densify_coords(coords: list, max_km: float = 75.0) -> list:
-    """
-    Insert geodesic intermediate waypoints so that no consecutive pair is
-    further apart than max_km.  This prevents the map renderer (MapLibre)
-    from drawing a straight line that visually crosses a landmass between
-    two ocean waypoints.
-
-    Antimeridian wrapping is preserved.
-    """
-    geod = Geodesic.WGS84
-    max_m = max_km * 1000.0
-    result = [coords[0]]
-
-    for i in range(len(coords) - 1):
-        a, b = coords[i], coords[i + 1]
-        try:
-            line = geod.InverseLine(a[1], a[0], b[1], b[0])
-            dist = line.s13
-            if dist > max_m:
-                n = int(dist / max_m) + 1
-                for j in range(1, n):
-                    pos = line.Position(j / n * dist)
-                    lon = pos["lon2"]
-                    # keep antimeridian continuity
-                    prev_lon = result[-1][0]
-                    if lon - prev_lon > 180:
-                        lon -= 360
-                    elif lon - prev_lon < -180:
-                        lon += 360
-                    result.append([lon, pos["lat2"]])
-        except Exception:
-            pass
-        result.append(b)
-
-    return result
-
-
-def _sanitize_route_coords(coords: list) -> list:
-    """
-    Ensure every intermediate waypoint lies in the ocean:
-
-    • Ocean cells                           → kept exactly as-is.
-    • Land cells with ocean within 0.5°     → snapped to that ocean cell.
-      (coastal nodes slightly inside a land cell at 1/4° resolution)
-    • Land cells with ocean only within 1.5° → kept as-is.
-      (narrow maritime passages: Suez Canal, Panama Canal, straits —
-       the nearest ocean is the distant sea, NOT a nearby lake; the node
-       is still a valid routing guide through the passage)
-    • Land cells with no ocean within 1.5°  → dropped (genuinely inland).
-
-    First and last points (departure / destination ports) are always kept
-    unchanged — ships dock at coasts.
-    """
-    if not _LAND_MASK_AVAILABLE and _NE_TREE is None:
-        return coords
-
-    cleaned = [coords[0]]   # always keep departure
-
-    for i in range(1, len(coords) - 1):
-        lon, lat = coords[i]
-        on_land = _is_land_hires(lat, lon)
-
-        if not on_land:
-            cleaned.append(coords[i])                    # ocean → keep
-        else:
-            # tight snap ≤ 0.3° (one grid cell) — catches coastal clips only.
-            # Canal/strait nodes are typically 0.35°+ from open water so they
-            # don't qualify here and fall through to the passage-keep rule.
-            snapped = _snap_to_ocean(lat, lon, max_radius_deg=0.3)
-            if snapped:
-                cleaned.append(snapped)                  # coastal clip → snap
-            elif _has_nearby_ocean(lat, lon, radius_deg=1.5):
-                cleaned.append(coords[i])               # canal/passage → keep as-is
-            # else: genuinely inland → drop silently
-
-    cleaned.append(coords[-1])  # always keep destination
-    return cleaned
-
-
-def _route_cache_key(start, end) -> tuple:
-    """
-    Bidirectional cache key: always places the lexicographically smaller point
-    first so that A→B and B→A map to the same key.
-    Coordinates are rounded to 4 decimal places (~11 m precision) so that
-    floating-point noise doesn't create spurious cache misses.
-    """
-    p1 = (round(start[0], 4), round(start[1], 4))
-    p2 = (round(end[0], 4), round(end[1], 4))
-    return (min(p1, p2), max(p1, p2))
-
-
-# In-memory route cache  {cache_key: (route_dict, canonical_start_tuple)}
-# The canonical_start is whichever endpoint was used as start when the route
-# was first computed; the cache consumer flips the coordinate list when the
-# request goes in the opposite direction.
-_route_cache: dict = {}
-
+    logging.warning(
+        "⚠️  Copernicus credentials not set. Wind/wave data endpoints will be unavailable. "
+        "Set COPERNICUS_USERNAME and COPERNICUS_PASSWORD in the .env file to enable them."
+    )
 
 def searoute_with_exact_end(start, end):
     """
     Calcule une route maritime entre deux points et ajoute un segment géodésique
     jusqu'à la destination exacte si searoute s'arrête trop tôt.
     Gère correctement le passage de l'antiméridien (180°/-180°).
-
-    Bidirectional cache: if the reverse segment B→A was already computed, the
-    cached coordinate list is reversed and returned immediately — ensuring that
-    the aller and retour legs between the same two waypoints render as a single
-    identical line on the map.
     """
-    import copy
-
-    cache_key = _route_cache_key(start, end)
-    canonical_start = (round(start[0], 4), round(start[1], 4))
-
-    if cache_key in _route_cache:
-        cached_route, cached_canonical_start = _route_cache[cache_key]
-        route = copy.deepcopy(cached_route)
-        # If this request goes in the opposite direction, reverse the coords
-        if canonical_start != cached_canonical_start:
-            route["geometry"]["coordinates"].reverse()
-        return route
-
     try:
         route = sr.searoute(start, end)
     except Exception as e:
@@ -589,90 +42,67 @@ def searoute_with_exact_end(start, end):
         return None
 
     coords = route["geometry"]["coordinates"]
-
-    geod = Geodesic.WGS84
-
-    # ── Exact start: prepend the origin if searoute snapped to a different node ──
-    first_point = coords[0]
-    start_dist = geod.Inverse(start[1], start[0], first_point[1], first_point[0])["s12"]
-    if start_dist > 1000:
-        coords.insert(0, [start[0], start[1]])
-
     last_point = coords[-1]
-    dist = geod.Inverse(last_point[1], last_point[0], end[1], end[0])["s12"]
 
-    if dist > 1000:
-        # Append the exact endpoint as a single segment — avoid_land will insert
-        # detour waypoints as needed.  Pre-interpolating with many 5 km sub-points
-        # previously caused problems: each tiny sub-segment crossing a large island
-        # (e.g. Basse-Terre / Guadeloupe) could not be individually rerouted, leading
-        # to an oscillating zigzag that never converged.
+    # Calcul de la distance entre le dernier point et le vrai point d'arrivée
+    geod = Geodesic.WGS84
+    dist = geod.Inverse(last_point[1], last_point[0], end[1], end[0])["s12"]  # mètres
+
+    # Si la route ne va pas jusqu'au point exact, on ajoute une courte ligne géodésique
+    if dist > 1000:  # seuil = 1 km
+        n_points = max(2, int(dist // 5000))  # environ 1 point tous les 5 km
         line = geod.InverseLine(last_point[1], last_point[0], end[1], end[0])
-        pos = line.Position(line.s13)
-        lon = pos["lon2"]
-        lat = pos["lat2"]
-        # Antimeridian normalisation relative to the preceding point
-        prev_lon = coords[-1][0]
-        if lon - prev_lon > 180:
-            lon -= 360
-        elif lon - prev_lon < -180:
-            lon += 360
-        coords.append([lon, lat])
-
-    # ── Avoid-Land Pipeline ─────────────────────────────────────────────────
-
-    # Step 1 — initial avoid-land pass: iteratively reroute every segment
-    #           that crosses any landmass or island (major coasts, peninsulas,
-    #           small islands like Nias / Mentawai).
-    coords = avoid_land(coords)
-
-    # Step 2 — densify: insert intermediate waypoints so no segment exceeds
-    #           75 km, preventing the renderer from drawing a chord that
-    #           visually crosses land between two distant ocean points.
-    coords = _densify_coords(coords, max_km=75)
-
-    # Step 3 — per-point cleanup: snap coastal clips to the nearest ocean
-    #           cell, preserve canal / strait passage nodes, drop inland stray
-    #           points introduced by earlier steps.
-    coords = _sanitize_route_coords(coords)
-
-    # Step 4 — second avoid-land pass: densification in Step 2 can place new
-    #           geodesic midpoints on small islands (e.g. Nias).  This final
-    #           iterative scan catches and reroutes any remaining crossings.
-    coords = avoid_land(coords, max_iterations=5)
+        extra_coords = []
+        
+        for i in range(1, n_points):
+            pos = line.Position(i * line.s13 / (n_points - 1))
+            lon = pos["lon2"]
+            lat = pos["lat2"]
+            
+            # Normaliser la longitude pour gérer le passage de l'antiméridien
+            if len(coords) > 0:
+                prev_lon = coords[-1][0] if len(extra_coords) == 0 else extra_coords[-1][0]
+                
+                if lon - prev_lon > 180:
+                    lon -= 360
+                elif lon - prev_lon < -180:
+                    lon += 360
+            
+            extra_coords.append([lon, lat])
+        
+        coords.extend(extra_coords)
 
     route["geometry"]["coordinates"] = coords
-
-    # Store in bidirectional cache so the reverse leg reuses this result
-    _route_cache[cache_key] = (copy.deepcopy(route), canonical_start)
-
     return route
 
 
 app = FastAPI(
-    title="NAVIGUIDE API",
-    description="API pour calculer un itinéraire maritime — Berry-Mappemonde Expedition.",
+    title="Searoute API",
+    description="API pour calculer un itinéraire maritime entre deux coordonnées.",
     version="1.0.0",
 )
 
+# Autoriser ton frontend React à communiquer avec l'API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # À restreindre plus tard à ton domaine React
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-class PositionRequest(BaseModel):
+# Modèle Pydantic pour la requête de vent
+class WindRequest(BaseModel):
     latitude: float
     longitude: float
 
 
 @app.get("/")
 def read_root():
+    """Endpoint de base pour vérifier que l'API fonctionne"""
     return {
-        "message": "NAVIGUIDE API is running",
+        "message": "Searoute API is running",
         "version": "1.0.0",
         "copernicus_configured": bool(COPERNICUS_USERNAME and COPERNICUS_PASSWORD)
     }
@@ -680,14 +110,17 @@ def read_root():
 
 @app.get("/route")
 def get_route(
-    start_lat: float = Query(...),
-    start_lon: float = Query(...),
-    end_lat: float = Query(...),
-    end_lon: float = Query(...),
-    check_wind: bool = Query(False),
-    sample_rate: int = Query(100)
+    start_lat: float = Query(..., description="Latitude de départ"),
+    start_lon: float = Query(..., description="Longitude de départ"),
+    end_lat: float = Query(..., description="Latitude d'arrivée"),
+    end_lon: float = Query(..., description="Longitude d'arrivée"),
+    check_wind: bool = Query(False, description="Vérifier les vents forts sur la route"),
+    sample_rate: int = Query(100, description="Vérifier 1 point tous les N points")
 ):
-    """Calcule une route maritime et renvoie le GeoJSON."""
+    """
+    Calcule une route maritime entre deux points et renvoie le GeoJSON.
+    Optionnellement, vérifie les vents forts sur la route.
+    """
     start = (start_lon, start_lat)
     end = (end_lon, end_lat)
 
@@ -695,37 +128,38 @@ def get_route(
         route = searoute_with_exact_end(start, end)
         if route is None:
             raise HTTPException(status_code=404, detail="Route non trouvée")
-
-        if check_wind and COPERNICUS_USERNAME and COPERNICUS_PASSWORD:
+        
+        # Si demandé, vérifier les vents sur la route
+        if check_wind:
+            # Récupérer les credentials depuis l'environnement ou la config
+            username = os.getenv("COPERNICUS_USERNAME")
+            password = os.getenv("COPERNICUS_PASSWORD")
+            
             route = add_wind_properties_to_route(
-                route,
-                username=COPERNICUS_USERNAME,
-                password=COPERNICUS_PASSWORD,
+                route, 
+                username=username, 
+                password=password,
                 sample_rate=sample_rate
             )
-        elif check_wind and not (COPERNICUS_USERNAME and COPERNICUS_PASSWORD):
-            # Return route without wind overlay if no credentials
-            return {
-                "type": "FeatureCollection",
-                "features": [route]
-            }
-
+        
         return route
-
-    except HTTPException:
-        raise
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 @app.post("/wind")
-def get_wind(request: PositionRequest):
-    """Récupère les données de vent à une position donnée via Copernicus Marine."""
-    if not COPERNICUS_USERNAME or not COPERNICUS_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="Copernicus credentials not configured"
-        )
+def get_wind(request: WindRequest):
+    """
+    Récupère les données de vent à une position donnée via Copernicus Marine
+    
+    Args:
+        request: WindRequest contenant latitude et longitude
+    
+    Returns:
+        dict: Données de vent (vitesse, direction, etc.)
+    """
     try:
         wind_data = get_wind_data_at_position(
             latitude=request.latitude,
@@ -733,64 +167,19 @@ def get_wind(request: PositionRequest):
             username=COPERNICUS_USERNAME,
             password=COPERNICUS_PASSWORD
         )
+        
         if wind_data is None:
-            raise HTTPException(status_code=404, detail="Aucune donnée de vent disponible")
+            raise HTTPException(
+                status_code=404, 
+                detail="Aucune donnée de vent disponible pour cette position"
+            )
+        
         return wind_data
-    except HTTPException:
-        raise
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération du vent: {str(e)}")
 
-
-@app.post("/wave")
-def get_wave(request: PositionRequest):
-    """Récupère les données de vague à une position donnée via Copernicus Marine."""
-    if not COPERNICUS_USERNAME or not COPERNICUS_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="Copernicus credentials not configured"
-        )
-    try:
-        wave_data = get_wave_data_at_position(
-            latitude=request.latitude,
-            longitude=request.longitude,
-            username=COPERNICUS_USERNAME,
-            password=COPERNICUS_PASSWORD
-        )
-        if wave_data is None:
-            raise HTTPException(status_code=404, detail="Aucune donnée de vague disponible")
-        return wave_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/current")
-def get_current(request: PositionRequest):
-    """Récupère les données de courant marin de surface via Copernicus Marine."""
-    if not COPERNICUS_USERNAME or not COPERNICUS_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="Copernicus credentials not configured"
-        )
-    try:
-        current_data = get_current_data_at_position(
-            latitude=request.latitude,
-            longitude=request.longitude,
-            username=COPERNICUS_USERNAME,
-            password=COPERNICUS_PASSWORD
-        )
-        if current_data is None:
-            raise HTTPException(status_code=404, detail="Aucune donnée de courant disponible")
-        return current_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# Point d'entrée pour lancer l'application
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 3007))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
