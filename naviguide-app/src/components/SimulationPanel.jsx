@@ -14,7 +14,7 @@
 import { Navigation, Clock, Compass, Map as MapIcon, X } from "lucide-react";
 import { useLang } from "../i18n/LangContext.jsx";
 
-// ── Formatage ────────────────────────────────────────────────────────────────
+// ── Formatage ───────────────────────────────────────────────────────────────────
 
 function formatEta(hours) {
   if (hours == null || isNaN(hours)) return "—";
@@ -37,9 +37,10 @@ function formatBearing(deg) {
   return `${Math.round(deg)}° ${dirs[idx]}`;
 }
 
-// ── Bouton Avancer ───────────────────────────────────────────────────────────
+// ── Bouton Avancer ──────────────────────────────────────────────────────────────────
 
-function AdvanceButton({ onAdvance, canAdvance, t }) {
+function AdvanceButton({ onAdvance, canAdvance }) {
+  const { t } = useLang();
   return (
     <div className="px-2 pb-2 pt-1">
       <button
@@ -52,18 +53,18 @@ function AdvanceButton({ onAdvance, canAdvance, t }) {
             ? "bg-cyan-700/60 text-white border-cyan-500/50 hover:bg-cyan-600/70 cursor-pointer"
             : "bg-slate-700/30 text-white/25 border-white/5 cursor-not-allowed",
         ].join(" ")}
-        title={canAdvance ? "Avancer au milieu du prochain segment" : "Fin de route atteinte"}
+        title={canAdvance ? t("advanceNextSegTitle") : t("endOfRoute")}
       >
         <Navigation size={9} />
         <span>
-          {t ? t("advanceToNextPoint") : "Avancer vers le prochain point"}
+          {t("advanceToNextPoint")}
         </span>
       </button>
     </div>
   );
 }
 
-// ── Composant principal ──────────────────────────────────────────────────────
+// ── Composant principal ────────────────────────────────────────────────────────────────
 
 export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) {
   const { t } = useLang();
@@ -72,12 +73,12 @@ export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) 
     return (
       <div className="bg-slate-800/60 rounded-xl p-3 border border-blue-700/30">
         <div className="text-xs text-slate-400 text-center">
-          {t ? t("simulationDragPrompt") : "Faites glisser le catamaran sur la route…"}
+          {t("simulationDragPrompt")}
         </div>
         {/* Bouton avancer visible même sans legContext (catamaran sur La Rochelle) */}
         {onAdvance && (
           <div className="mt-2">
-            <AdvanceButton onAdvance={onAdvance} canAdvance={canAdvance} t={t} />
+            <AdvanceButton onAdvance={onAdvance} canAdvance={canAdvance} />
           </div>
         )}
       </div>
@@ -109,7 +110,7 @@ export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) 
           <button
             onClick={onClose}
             className="text-white/30 hover:text-white/70 transition-colors flex-shrink-0 ml-1"
-            title={t ? t("exitSimulation") : "Quitter la simulation"}
+            title={t("exitSimulation")}
           >
             <X size={12} />
           </button>
@@ -124,7 +125,7 @@ export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) 
           <div className="flex items-center gap-1">
             <MapIcon size={10} className="text-cyan-400" />
             <span className="text-[9px] text-slate-400 uppercase tracking-wider">
-              {t ? t("nmRemaining") : "Restants"}
+              {t("nmRemaining")}
             </span>
           </div>
           <span className="text-sm font-bold text-white">{formatNm(nmRemainingToStop)}</span>
@@ -135,11 +136,11 @@ export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) 
           <div className="flex items-center gap-1">
             <Clock size={10} className="text-amber-400" />
             <span className="text-[9px] text-slate-400 uppercase tracking-wider">
-              {t ? t("eta") : "ETA"}
+              {t("eta")}
             </span>
           </div>
           <span className="text-sm font-bold text-white">{formatEta(etaHours)}</span>
-          <span className="text-[9px] text-slate-500">@ {speedKnots} nœuds</span>
+          <span className="text-[9px] text-slate-500">@ {speedKnots} kt</span>
         </div>
 
         {/* NM parcourus */}
@@ -147,7 +148,7 @@ export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) 
           <div className="flex items-center gap-1">
             <Navigation size={10} className="text-green-400" />
             <span className="text-[9px] text-slate-400 uppercase tracking-wider">
-              {t ? t("nmCovered") : "Parcourus"}
+              {t("nmCovered")}
             </span>
           </div>
           <span className="text-sm font-bold text-white">{formatNm(nmCovered)}</span>
@@ -158,7 +159,7 @@ export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) 
           <div className="flex items-center gap-1">
             <Compass size={10} className="text-purple-400" />
             <span className="text-[9px] text-slate-400 uppercase tracking-wider">
-              {t ? t("bearing") : "Cap"}
+              {t("bearing")}
             </span>
           </div>
           <span className="text-sm font-bold text-white">{formatBearing(bearing)}</span>
@@ -168,7 +169,7 @@ export function SimulationPanel({ legContext, onClose, onAdvance, canAdvance }) 
 
       {/* Bouton Avancer vers le prochain point (escale ou intermédiaire) */}
       {onAdvance && (
-        <AdvanceButton onAdvance={onAdvance} canAdvance={canAdvance} t={t} />
+        <AdvanceButton onAdvance={onAdvance} canAdvance={canAdvance} />
       )}
 
     </div>
