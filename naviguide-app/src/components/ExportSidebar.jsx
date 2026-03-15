@@ -10,9 +10,11 @@ import { ChevronLeft, ChevronRight, Download, Anchor, Upload, Compass, CheckCirc
 import { useLang } from "../i18n/LangContext.jsx";
 
 /* ── Polar constants ──────────────────────────────────────────────────────── */
-const POLAR_API_URL      = import.meta.env.VITE_POLAR_API_URL ?? "http://localhost:8004";
-const POLAR_EXPEDITION   = "berry-mappemonde-2026";
-const POLAR_VMG_TWS_KEYS = ["8", "10", "12", "16", "20", "25"];
+const POLAR_API_URL        = import.meta.env.VITE_POLAR_API_URL ?? "http://localhost:8004";
+const POLAR_EXPEDITION     = "berry-mappemonde-2026";
+const POLAR_VMG_TWS_KEYS  = ["8", "10", "12", "16", "20", "25"];
+const DEFAULT_POLAR_URL   = "/Leopard46_Standard_Sails.csv";
+const DEFAULT_POLAR_NAME  = "Leopard 46";
 
 function kts(v) { return v != null ? `${Number(v).toFixed(1)} kt` : "—"; }
 function deg(v) { return v != null ? `${Math.round(v)}°`          : "—"; }
@@ -306,11 +308,52 @@ export function ExportSidebar({
   const [polarUploadDetail, setPolarUploadDetail] = useState("");
   const [isDragging,        setIsDragging]        = useState(false);
   const polarFileInputRef                         = useRef(null);
+  const defaultLoadAttemptedRef                   = useRef(false);
+  const userDroppedFileRef                        = useRef(false);
 
   useEffect(() => {
     if (polarFile) handlePolarUpload(polarFile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [polarFile]);
+
+  /* ── Chargement par défaut des polaires Leopard 46 ───────────────────────── */
+  useEffect(() => {
+    if (polarData || defaultLoadAttemptedRef.current) return;
+    defaultLoadAttemptedRef.current = true;
+
+    const loadDefaultPolars = async () => {
+      setPolarUploadStatus("uploading");
+      setPolarUploadDetail("");
+      try {
+        const res = await fetch(DEFAULT_POLAR_URL);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        const file = new File([blob], "Leopard46_Standard_Sails.csv", { type: "text/csv" });
+        const form = new FormData();
+        form.append("file", file);
+        form.append("expedition_id", POLAR_EXPEDITION);
+        form.append("boat_name", DEFAULT_POLAR_NAME);
+        const uploadRes = await fetch(`${POLAR_API_URL}/api/v1/polar/upload`, { method: "POST", body: form });
+        const data = await uploadRes.json();
+        if (!uploadRes.ok) throw new Error(data.detail ?? `HTTP ${uploadRes.status}`);
+        if (userDroppedFileRef.current) return; // L'utilisateur a déposé pendant le chargement
+        onPolarDataLoaded({
+          expedition_id: data.expedition_id,
+          boat_name:     data.boat_name,
+          grid_shape:    data.grid_shape,
+          vmg_summary:   data.vmg_summary,
+          created_at:    data.created_at,
+        });
+        setPolarUploadStatus("success");
+        setPolarUploadDetail(data.boat_name);
+      } catch (err) {
+        if (userDroppedFileRef.current) return;
+        setPolarUploadStatus("error");
+        setPolarUploadDetail(String(err?.message ?? err));
+      }
+    };
+    loadDefaultPolars();
+  }, [polarData, onPolarDataLoaded]);
 
   const handlePolarUpload = async (f) => {
     setPolarUploadStatus("uploading");
@@ -481,7 +524,10 @@ export function ExportSidebar({
                 e.preventDefault(); setIsDragging(false);
                 const f = e.dataTransfer.files?.[0];
                 const ok = [".pdf",".csv",".xlsx",".xls"];
-                if (f && ok.some(ext => f.name.toLowerCase().endsWith(ext))) setPolarFile(f);
+                if (f && ok.some(ext => f.name.toLowerCase().endsWith(ext))) {
+                  userDroppedFileRef.current = true;
+                  setPolarFile(f);
+                }
               }}
               onClick={() => polarFileInputRef.current?.click()}
               className={`flex flex-col items-center justify-center gap-1.5 p-4
@@ -499,7 +545,7 @@ export function ExportSidebar({
                 type="file"
                 accept=".pdf,.csv,.xlsx,.xls"
                 className="hidden"
-                onChange={(e) => { const f = e.target.files?.[0]; if (f) setPolarFile(f); }}
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) { userDroppedFileRef.current = true; setPolarFile(f); } }}
               />
               {polarUploadStatus === "uploading"
                 ? <Loader2 size={18} className="animate-spin text-blue-400" />
@@ -507,10 +553,15 @@ export function ExportSidebar({
               }
               {polarFile
                 ? <span className="text-xs font-medium text-green-300 text-center break-all">{polarFile.name}</span>
-                : <>
-                    <span className="text-xs text-slate-400">{t("polarDropZone")}</span>
-                    <span className="text-xs text-slate-600">{t("polarFormats")}</span>
-                  </>
+                : polarUploadStatus === "success"
+                  ? <>
+                      <span className="text-xs font-medium text-green-300">{polarUploadDetail}</span>
+                      <span className="text-xs text-slate-500">{t("polarDropToReplace")}</span>
+                    </>
+                  : <>
+                      <span className="text-xs text-slate-400">{t("polarDropZone")}</span>
+                      <span className="text-xs text-slate-600">{t("polarFormats")}</span>
+                    </>
               }
             </div>
 

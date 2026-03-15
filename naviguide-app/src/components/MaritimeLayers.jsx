@@ -14,22 +14,19 @@
 
 import { useEffect, useState } from "react";
 import { Source, Layer } from "react-map-gl/maplibre";
+import { useLang } from "../i18n/LangContext.jsx";
 
-const API_URL = import.meta.env.VITE_API_URL;
+// Toujours URL absolue pour les tuiles (évite les problèmes de proxy Vite / preview).
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 
 // ── Layer paint styles ────────────────────────────────────────────────────────
 
-const ZEE_FILL_PAINT = {
-  "fill-color": "rgba(14, 116, 144, 0.07)",
-  "fill-outline-color": "rgba(14, 116, 144, 0)",
-};
-const ZEE_LINE_PAINT = {
-  "line-color": "#0e7490",
-  "line-width": 1.5,
-  "line-dasharray": [5, 3],
-  "line-opacity": 0.8,
-};
+// ZEE via WMS — layer eez_boundaries = limites uniquement (polylignes, pas de polygones)
+// Tuiles 512×512 pour un rendu plus fin au zoom minimal (moins de flou/épaisseur)
+const ZEE_WMS_TILES = [
+  `${API_BASE}/proxy/zee/wms?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=eez_boundaries&FORMAT=image/png&TRANSPARENT=true&SRS=EPSG:3857&WIDTH=512&HEIGHT=512&BBOX={bbox-epsg-3857}`,
+];
 const PORTS_CIRCLE_PAINT = {
   "circle-radius": ["interpolate", ["linear"], ["zoom"], 1, 2, 6, 4, 10, 7],
   "circle-color": "#f59e0b",
@@ -44,14 +41,9 @@ const OPENSEAMAP_RASTER_PAINT = {
 
 // ── Fetchers ──────────────────────────────────────────────────────────────────
 
-async function fetchZee() {
-  const res = await fetch(`${API_URL}/proxy/zee?maxFeatures=200`);
-  if (!res.ok) throw new Error(`ZEE HTTP ${res.status}`);
-  return res.json();
-}
-
 async function fetchPorts() {
-  const res = await fetch(`${API_URL}/proxy/ports`);
+  const url = `${API_BASE}/proxy/ports`;
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`Ports HTTP ${res.status}`);
   return res.json();
 }
@@ -69,41 +61,21 @@ export function useMaritimeLayers() {
   const [showPorts,    setShowPorts]    = useState(true);
   const [showBalisage, setShowBalisage] = useState(true);
 
-  const [zeeData,   setZeeData]   = useState(EMPTY_FC);
   const [portsData, setPortsData] = useState(EMPTY_FC);
 
-  const [loadingZee,   setLoadingZee]   = useState(false);
   const [loadingPorts, setLoadingPorts] = useState(false);
 
-  const [errorZee,   setErrorZee]   = useState(null);
   const [errorPorts, setErrorPorts] = useState(null);
 
-  // Lazy-load ZEE — différé de 3 s pour ne pas concurrencer le chargement des routes
-  useEffect(() => {
-    if (!showZee || zeeData.features.length > 0) return;
-    const t = setTimeout(() => {
-      setLoadingZee(true);
-      setErrorZee(null);
-      fetchZee()
-        .then(setZeeData)
-        .catch((e) => { console.warn("[MaritimeLayers] ZEE:", e); setErrorZee(e.message); })
-        .finally(() => setLoadingZee(false));
-    }, 3000);
-    return () => clearTimeout(t);
-  }, [showZee]);
-
-  // Lazy-load WPI ports — différé de 5 s (staggeré après ZEE)
+  // Chargement Ports — immédiat
   useEffect(() => {
     if (!showPorts || portsData.features.length > 0) return;
-    const t = setTimeout(() => {
-      setLoadingPorts(true);
-      setErrorPorts(null);
-      fetchPorts()
-        .then(setPortsData)
-        .catch((e) => { console.warn("[MaritimeLayers] Ports:", e); setErrorPorts(e.message); })
-        .finally(() => setLoadingPorts(false));
-    }, 5000);
-    return () => clearTimeout(t);
+    setLoadingPorts(true);
+    setErrorPorts(null);
+    fetchPorts()
+      .then((data) => { setPortsData(data); })
+      .catch((e) => { console.warn("[MaritimeLayers] Ports:", e.message || e); setErrorPorts(e.message || String(e)); })
+      .finally(() => setLoadingPorts(false));
   }, [showPorts]);
 
   return {
@@ -112,14 +84,13 @@ export function useMaritimeLayers() {
     showPorts,    setShowPorts,
     showBalisage, setShowBalisage,
     // Data
-    zeeData,
     portsData,
     // Loading flags
-    loadingZee,
+    loadingZee: false,   // ZEE WMS = tuiles, pas de fetch
     loadingPorts,
-    loadingBalisage: false,   // OpenSeaMap tiles load automatically
+    loadingBalisage: false,
     // Error messages
-    errorZee,
+    errorZee: null,
     errorPorts,
     errorBalisage: null,
   };
@@ -140,7 +111,7 @@ export function useMaritimeLayers() {
  *  - Balisage  : tuiles raster OpenSeaMap (chargées directement depuis le navigateur)
  */
 export function MaritimeLayers({
-  showZee, zeeData,
+  showZee,
   showPorts, portsData,
   showBalisage,
 }) {
@@ -148,71 +119,71 @@ export function MaritimeLayers({
 
   return (
     <>
-      {/* ── ZEE polygons — rendu SOUS la route bleue (beforeId) ─────────── */}
-      <Source id="zee-source" type="geojson" data={zeeData}>
-        <Layer id="zee-fill" type="fill"  beforeId="maritime-layer" layout={vis(showZee)} paint={ZEE_FILL_PAINT} />
-        <Layer id="zee-line" type="line"  beforeId="maritime-layer" layout={vis(showZee)} paint={ZEE_LINE_PAINT} />
-      </Source>
-
-      {/* ── WPI ports circles — rendu SOUS la route bleue ────────────────── */}
-      <Source id="ports-source" type="geojson" data={portsData}>
-        <Layer id="ports-circle" type="circle" beforeId="maritime-layer" layout={vis(showPorts)} paint={PORTS_CIRCLE_PAINT} />
-      </Source>
-
-      {/* ── OpenSeaMap balisage — raster tile overlay SOUS la route bleue ── */}
-      {/* NOTE: raster-opacity (paint) plutôt que layout.visibility car MapLibre
-          ne charge pas les tuiles des layers "none". */}
+      {/* ── ZEE via WMS (tuiles à la demande, instantané) ────────────────── */}
       <Source
-        id="openseamap-source"
+        id="zee-source"
         type="raster"
-        tiles={["https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png"]}
-        tileSize={256}
-        attribution="© <a href='https://www.openseamap.org' target='_blank'>OpenSeaMap</a>"
+        tiles={ZEE_WMS_TILES}
+        tileSize={512}
+        minzoom={1}
+        maxzoom={18}
       >
         <Layer
-          id="openseamap-layer"
+          id="zee-layer"
           type="raster"
-          beforeId="maritime-layer"
-          paint={{ "raster-opacity": showBalisage ? 0.85 : 0 }}
+          layout={vis(showZee)}
+          paint={{
+            "raster-opacity": ["interpolate", ["linear"], ["zoom"], 1, 0.25, 3, 0.45, 6, 0.7, 10, 0.9],
+            "raster-fade-duration": 0,
+            "raster-resampling": "nearest",
+          }}
         />
       </Source>
+
+      {/* ── WPI ports circles ───────────────────────────────────────────── */}
+      <Source id="ports-source" type="geojson" data={portsData}>
+        <Layer id="ports-circle" type="circle" layout={vis(showPorts)} paint={PORTS_CIRCLE_PAINT} />
+      </Source>
     </>
+  );
+}
+
+/** Balisage — raster au-dessus de tout (routes, markers). À placer EN DERNIER dans <Map>. */
+const SEAMARK_TILES = [
+  `${API_BASE}/proxy/seamark/{z}/{x}/{y}.png`,
+  "https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
+];
+
+export function BalisageLayer({ show }) {
+  return (
+    <Source
+      id="openseamap-source"
+      type="raster"
+      tiles={SEAMARK_TILES}
+      tileSize={256}
+      minzoom={1}
+      maxzoom={19}
+      attribution="© OpenSeaMap"
+    >
+      <Layer
+        id="openseamap-layer"
+        type="raster"
+        layout={{ visibility: show ? "visible" : "none" }}
+        paint={{
+          "raster-opacity": 1,
+          "raster-fade-duration": 0,
+        }}
+      />
+    </Source>
   );
 }
 
 // ── Toggle panel (render outside <Map>) ──────────────────────────────────────
 
 const LAYER_CONFIG = [
-  {
-    key: "zee",
-    label: "ZEE",
-    title: "Zones Économiques Exclusives (VLIZ)",
-    color: "#0e7490",
-    showKey: "showZee",
-    toggleKey: "setShowZee",
-    loadingKey: "loadingZee",
-    errorKey: "errorZee",
-  },
-  {
-    key: "ports",
-    label: "Ports WPI",
-    title: "Ports mondiaux — World Port Index (NGA)",
-    color: "#f59e0b",
-    showKey: "showPorts",
-    toggleKey: "setShowPorts",
-    loadingKey: "loadingPorts",
-    errorKey: "errorPorts",
-  },
-  {
-    key: "balisage",
-    label: "Balisage",
-    title: "Balisage maritime (OpenSeaMap)",
-    color: "#10b981",
-    showKey: "showBalisage",
-    toggleKey: "setShowBalisage",
-    loadingKey: "loadingBalisage",
-    errorKey: "errorBalisage",
-  },
+  { key: "zee",      labelKey: "layerZee",      titleKey: "layerZeeTitle",      color: "#0e7490", showKey: "showZee",      toggleKey: "setShowZee",      loadingKey: "loadingZee",      errorKey: "errorZee" },
+  { key: "ports",    labelKey: "layerPorts",    titleKey: "layerPortsTitle",    color: "#f59e0b", showKey: "showPorts",    toggleKey: "setShowPorts",    loadingKey: "loadingPorts",    errorKey: "errorPorts" },
+  { key: "balisage", labelKey: "layerBalisage", titleKey: "layerBalisageTitle", color: "#10b981", showKey: "showBalisage", toggleKey: "setShowBalisage", loadingKey: "loadingBalisage", errorKey: "errorBalisage" },
 ];
 
 /**
@@ -221,6 +192,7 @@ const LAYER_CONFIG = [
  * À placer EN DEHORS du composant <Map>, dans le div racine de l'application.
  */
 export function MaritimeLayersPanel(props) {
+  const { t } = useLang();
   return (
     /* Centré en bas, entre les deux sidebars (chacune 320px) — toujours visible */
     <div
@@ -230,10 +202,10 @@ export function MaritimeLayersPanel(props) {
     >
       {/* Label */}
       <span className="text-white/35 text-[9px] font-semibold uppercase tracking-widest mr-1 select-none">
-        Couches
+        {t("layersLabel")}
       </span>
 
-      {LAYER_CONFIG.map(({ key, label, title, color, showKey, toggleKey, loadingKey, errorKey }) => {
+      {LAYER_CONFIG.map(({ key, labelKey, titleKey, color, showKey, toggleKey, loadingKey, errorKey }) => {
         const active  = props[showKey];
         const loading = props[loadingKey];
         const error   = props[errorKey];
@@ -242,7 +214,7 @@ export function MaritimeLayersPanel(props) {
           <button
             key={key}
             onClick={() => props[toggleKey]((v) => !v)}
-            title={title}
+            title={t(titleKey)}
             className={[
               "flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold",
               "transition-all duration-150 select-none",
@@ -263,7 +235,7 @@ export function MaritimeLayersPanel(props) {
                 }}
               />
             )}
-            <span>{label}</span>
+            <span>{t(labelKey)}</span>
             {error && !loading && (
               <span className="text-red-400 text-[10px]" title={error}>⚠</span>
             )}

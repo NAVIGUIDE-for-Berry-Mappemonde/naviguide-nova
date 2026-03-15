@@ -245,12 +245,15 @@ def llm_expedition_briefing_node(state: OrchestratorState) -> OrchestratorState:
     """
     Generate unified executive skipper briefing combining Agent 1 + Agent 3 outputs.
     Uses ChatBedrock (Claude 3.5) if available; falls back to structured static text.
+    Output language follows state["language"] ("en" | "fr").
     """
     route_plan   = state.get("route_plan", {})
     risk_report  = state.get("risk_report", {})
     risk_level   = state.get("expedition_risk_level", "UNKNOWN")
     waypoints    = state.get("waypoints", [])
     anti_avg     = state.get("anti_shipping_avg", 0.0)
+    language     = state.get("language", "en")
+    lang_en      = language == "en"
 
     # Gather key data for the prompt
     risk_metadata   = risk_report.get("metadata", {})
@@ -262,6 +265,8 @@ def llm_expedition_briefing_node(state: OrchestratorState) -> OrchestratorState:
 
     # Build compact per-waypoint risk table (sorted by risk descending)
     sorted_matrix = sorted(risk_matrix, key=lambda x: x.get("overall", 0), reverse=True)
+    _no_data_fr = "  Aucune donnée de risque disponible."
+    _no_data_en = "  No risk data available."
     risk_rows = "\n".join(
         f"  {s['name'][:28]:<28} {s['level']:<8} "
         f"ovr={s['overall']:.2f} "
@@ -270,7 +275,7 @@ def llm_expedition_briefing_node(state: OrchestratorState) -> OrchestratorState:
         f"med={s['components'].get('medical_score',0):.2f} "
         f"cyc={s['components'].get('cyclone_score',0):.2f}"
         for s in sorted_matrix
-    ) or "  Aucune donnée de risque disponible."
+    ) or (_no_data_en if lang_en else _no_data_fr)
 
     # Medical details for isolated stops (medevac ≥ 48h)
     medical_list = detail.get("medical_access", [])
@@ -278,7 +283,9 @@ def llm_expedition_briefing_node(state: OrchestratorState) -> OrchestratorState:
         f"  • {m['name']}: {m['medevac_hours']}h medevac — {m.get('notes','')[:60]}"
         for m in medical_list if m.get("medevac_hours", 0) >= 48
     ]
-    medical_detail = "\n".join(isolated) or "  Aucun isolement médical critique."
+    _med_none_fr = "  Aucun isolement médical critique."
+    _med_none_en = "  No critical medical isolation."
+    medical_detail = "\n".join(isolated) or (_med_none_en if lang_en else _med_none_fr)
 
     # Cyclone basins active
     cyclone_list = detail.get("cyclone_exposure", [])
@@ -286,21 +293,56 @@ def llm_expedition_briefing_node(state: OrchestratorState) -> OrchestratorState:
         c["basin"] for c in cyclone_list
         if c.get("season_active") or c.get("in_peak")
     })
-    cyclone_str = ", ".join(active_cyclone) or "Aucun bassin actif au départ prévu"
+    _cyc_none_fr = "Aucun bassin actif au départ prévu"
+    _cyc_none_en = "No active basin at planned departure"
+    cyclone_str = ", ".join(active_cyclone) or (_cyc_none_en if lang_en else _cyc_none_fr)
 
     # Piracy zones hit
     piracy_list = detail.get("piracy_zones", [])
     piracy_zones = list({
         p["zone"] for p in piracy_list if p.get("score", 0) >= 0.30
     })
-    piracy_str = ", ".join(piracy_zones) or "Aucune zone à risque élevé"
+    _pir_none_fr = "Aucune zone à risque élevé"
+    _pir_none_en = "No high-risk zone"
+    piracy_str = ", ".join(piracy_zones) or (_pir_none_en if lang_en else _pir_none_fr)
 
+    _crit_none_fr = "  Aucune alerte critique détectée."
+    _crit_none_en = "  No critical alerts detected."
     critical_list = "\n".join(
-        f"  • {a['waypoint']} [{a['risk_level']}] — risque dominant: {a.get('dominant_risk','N/A')}"
+        f"  • {a['waypoint']} [{a['risk_level']}] — {'dominant risk' if lang_en else 'risque dominant'}: {a.get('dominant_risk','N/A')}"
         for a in critical_alerts
-    ) or "  Aucune alerte critique détectée."
+    ) or (_crit_none_en if lang_en else _crit_none_fr)
 
-    prompt = f"""Tu es le chef officier de sécurité maritime de NAVIGUIDE, spécialiste en circumnavigations hauturières.
+    if lang_en:
+        prompt = f"""You are NAVIGUIDE's chief maritime safety officer, specialist in offshore circumnavigations.
+
+BERRY-MAPPEMONDE EXPEDITION — FULL RISK PROFILE
+═══════════════════════════════════════════════════════
+Stops: {len(waypoints)} | Distance: {total_nm:,.0f} nm | Overall risk: {risk_level}
+Anti-shipping avg: {anti_avg:.3f} | CRITICAL: {risk_metadata.get('critical_stops_count',0)} | HIGH: {risk_metadata.get('high_risk_stops_count',0)}
+
+RISK MATRIX BY STOP (sorted by risk descending):
+Stop                         Level    Ovr   Wx    Pir.  Med.  Cyc.
+{risk_rows}
+
+CRITICAL/HIGH ALERTS:
+{critical_list}
+
+CRITICAL MEDICAL ACCESS (medevac ≥48h):
+{medical_detail}
+
+ACTIVE PIRACY ZONES (score≥0.30): {piracy_str}
+ACTIVE CYCLONE BASINS: {cyclone_str}
+
+Write a skipper briefing with EXACTLY these 4 sections:
+1. EXECUTIVE SUMMARY (2-3 sentences)
+2. TOP CRITICAL RISKS (max 4 bullets, each with concrete mitigation)
+3. WEATHER WINDOWS BY BASIN (1 sentence/basin)
+4. NON-NEGOTIABLE REQUIREMENTS (3 bullets)
+
+Tone: professional offshore, concise. Max 280 words. Write the ENTIRE briefing in English."""
+    else:
+        prompt = f"""Tu es le chef officier de sécurité maritime de NAVIGUIDE, spécialiste en circumnavigations hauturières.
 
 EXPÉDITION BERRY-MAPPEMONDE — PROFIL DE RISQUE COMPLET
 ═══════════════════════════════════════════════════════
@@ -326,7 +368,7 @@ Rédige un briefing skipper avec EXACTEMENT ces 4 sections:
 3. FENÊTRES MÉTÉO PAR BASSIN (1 phrase/bassin)
 4. EXIGENCES NON NÉGOCIABLES (3 bullets)
 
-Ton: professionnel hauturier, concis. Max 280 mots. En français."""
+Ton: professionnel hauturier, concis. Max 280 mots. Rédige l'intégralité du briefing en français."""
 
     briefing = ""
 
@@ -345,7 +387,7 @@ Ton: professionnel hauturier, concis. Max 280 mots. En français."""
         # Structured fallback briefing (includes critical alerts from full risk matrix)
         briefing = _build_fallback_briefing(
             risk_level, critical_alerts, total_nm, len(waypoints),
-            sorted_matrix, isolated
+            sorted_matrix, isolated, language=language
         )
 
     msg = AIMessage(content=f"[llm_briefing] ✅ Executive briefing generated ({len(briefing)} chars)")
@@ -364,47 +406,80 @@ def _build_fallback_briefing(
     waypoint_count: int,
     sorted_matrix: list = None,
     isolated_medical: list = None,
+    language: str = "en",
 ) -> str:
-    """Structured fallback when LLM is unavailable."""
+    """Structured fallback when LLM is unavailable. Output in language."""
     sorted_matrix    = sorted_matrix    or []
     isolated_medical = isolated_medical or []
+    lang_en          = language == "en"
 
     # Use critical_alerts; if empty, pull top-risk entries from matrix
+    def _dominant(c):
+        comp = c.get("components") or {}
+        return max(comp, key=comp.get) if comp else "N/A"
+
     top_alerts = critical_alerts[:4] if critical_alerts else [
-        {"waypoint": s["name"], "risk_level": s["level"],
-         "dominant_risk": max(s["components"], key=s["components"].get)}
+        {"waypoint": s["name"], "risk_level": s["level"], "dominant_risk": _dominant(s)}
         for s in sorted_matrix[:4] if s.get("level") in ("CRITICAL", "HIGH", "MODERATE")
     ]
     alerts_text = "\n".join(
-        f"• {a['waypoint']} [{a['risk_level']}] — {a.get('dominant_risk', 'risque composite')}"
+        f"• {a['waypoint']} [{a['risk_level']}] — {a.get('dominant_risk', 'composite risk' if lang_en else 'risque composite')}"
         for a in top_alerts
-    ) or "• Aucune alerte critique sur le tracé."
+    ) or ("• No critical alerts on the route." if lang_en else "• Aucune alerte critique sur le tracé.")
 
-    medical_text = "\n".join(isolated_medical[:3]) or "• Accès médical acceptable sur l'ensemble du tracé."
-
-    return (
-        f"BRIEFING EXPÉDITION BERRY-MAPPEMONDE — TOUR DU MONDE DES TERRITOIRES FRANÇAIS\n\n"
-        f"1. RÉSUMÉ EXÉCUTIF\n"
-        f"L'expédition Berry-Mappemonde couvre {total_nm:,.0f} milles nautiques à travers "
-        f"{waypoint_count} escales dans les territoires français d'outre-mer. "
-        f"Le niveau de risque global évalué est {risk_level}. "
-        f"Une préparation approfondie et un calendrier respectant les fenêtres météo "
-        f"saisonnières sont impératifs.\n\n"
-        f"2. ALERTES CRITIQUES\n"
-        f"{alerts_text}\n\n"
-        f"3. ISOLEMENT MÉDICAL\n"
-        f"{medical_text}\n\n"
-        f"4. FENÊTRES MÉTÉO RECOMMANDÉES\n"
-        f"• Atlantique N (La Rochelle → Canaries) : mai–juin (alizés établis)\n"
-        f"• Atlantique tropical (Canaries → Caraïbes) : novembre–janvier\n"
-        f"• Pacifique S (Cayenne → Papeete) : avril–juin (hors cyclone)\n"
-        f"• Océan Indien S (Nouméa → Réunion) : mai–septembre\n\n"
-        f"5. EXIGENCES DE SÉCURITÉ NON NÉGOCIABLES\n"
-        f"• Balise EPIRB 406 MHz homologuée + AIS classe B actif permanent\n"
-        f"• Trousse médicale hauturière complète + formation premiers secours en mer\n"
-        f"• Éviter les zones cycloniques en saison active (voir alertes ci-dessus)\n\n"
-        f"Bonne route, Commandant. NAVIGUIDE surveille votre expédition."
+    medical_text = "\n".join(isolated_medical[:3]) or (
+        "• Medical access acceptable on the full route." if lang_en
+        else "• Accès médical acceptable sur l'ensemble du tracé."
     )
+
+    if lang_en:
+        return (
+            f"BERRY-MAPPEMONDE EXPEDITION BRIEFING — FRENCH TERRITORIES WORLD TOUR\n\n"
+            f"1. EXECUTIVE SUMMARY\n"
+            f"The Berry-Mappemonde expedition covers {total_nm:,.0f} nautical miles across "
+            f"{waypoint_count} stops in French overseas territories. "
+            f"The assessed overall risk level is {risk_level}. "
+            f"Thorough preparation and a schedule respecting seasonal weather windows "
+            f"are imperative.\n\n"
+            f"2. CRITICAL ALERTS\n"
+            f"{alerts_text}\n\n"
+            f"3. MEDICAL ISOLATION\n"
+            f"{medical_text}\n\n"
+            f"4. RECOMMENDED WEATHER WINDOWS\n"
+            f"• North Atlantic (La Rochelle → Canaries): May–June (trade winds established)\n"
+            f"• Tropical Atlantic (Canaries → Caribbean): November–January\n"
+            f"• South Pacific (Cayenne → Papeete): April–June (outside cyclone season)\n"
+            f"• South Indian Ocean (Nouméa → Réunion): May–September\n\n"
+            f"5. NON-NEGOTIABLE SAFETY REQUIREMENTS\n"
+            f"• Certified 406 MHz EPIRB beacon + permanent active Class B AIS\n"
+            f"• Complete offshore medical kit + sea first aid training\n"
+            f"• Avoid cyclone zones during active season (see alerts above)\n\n"
+            f"Fair winds, Captain. NAVIGUIDE monitors your expedition."
+        )
+    else:
+        return (
+            f"BRIEFING EXPÉDITION BERRY-MAPPEMONDE — TOUR DU MONDE DES TERRITOIRES FRANÇAIS\n\n"
+            f"1. RÉSUMÉ EXÉCUTIF\n"
+            f"L'expédition Berry-Mappemonde couvre {total_nm:,.0f} milles nautiques à travers "
+            f"{waypoint_count} escales dans les territoires français d'outre-mer. "
+            f"Le niveau de risque global évalué est {risk_level}. "
+            f"Une préparation approfondie et un calendrier respectant les fenêtres météo "
+            f"saisonnières sont impératifs.\n\n"
+            f"2. ALERTES CRITIQUES\n"
+            f"{alerts_text}\n\n"
+            f"3. ISOLEMENT MÉDICAL\n"
+            f"{medical_text}\n\n"
+            f"4. FENÊTRES MÉTÉO RECOMMANDÉES\n"
+            f"• Atlantique N (La Rochelle → Canaries) : mai–juin (alizés établis)\n"
+            f"• Atlantique tropical (Canaries → Caraïbes) : novembre–janvier\n"
+            f"• Pacifique S (Cayenne → Papeete) : avril–juin (hors cyclone)\n"
+            f"• Océan Indien S (Nouméa → Réunion) : mai–septembre\n\n"
+            f"5. EXIGENCES DE SÉCURITÉ NON NÉGOCIABLES\n"
+            f"• Balise EPIRB 406 MHz homologuée + AIS classe B actif permanent\n"
+            f"• Trousse médicale hauturière complète + formation premiers secours en mer\n"
+            f"• Éviter les zones cycloniques en saison active (voir alertes ci-dessus)\n\n"
+            f"Bonne route, Commandant. NAVIGUIDE surveille votre expédition."
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

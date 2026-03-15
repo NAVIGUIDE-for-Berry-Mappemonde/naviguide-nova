@@ -595,19 +595,23 @@ export function Sidebar({ plan, open, onToggle, onRouteImport, onRouteSwitchToBe
 
           {/* ── Maritime layer toggles — ligne horizontale sous Berry-Mappemonde ── */}
           {maritimeLayers && (
-            <div className="flex items-center gap-1 mt-2.5">
+            <div className="flex flex-col gap-1 mt-2.5">
+              <div className="flex items-center gap-1">
               {[
-                { key: "zee",      label: "ZEE",     color: "#0e7490", showKey: "showZee",      toggleKey: "setShowZee",      loadingKey: "loadingZee"      },
-                { key: "ports",    label: "Ports",   color: "#f59e0b", showKey: "showPorts",    toggleKey: "setShowPorts",    loadingKey: "loadingPorts"    },
-                { key: "balisage", label: "Balisage",color: "#10b981", showKey: "showBalisage", toggleKey: "setShowBalisage", loadingKey: "loadingBalisage" },
-              ].map(({ key, label, color, showKey, toggleKey, loadingKey }) => {
+                { key: "zee",      labelKey: "layerZee",      color: "#0e7490", showKey: "showZee",      toggleKey: "setShowZee",      loadingKey: "loadingZee",      errorKey: "errorZee" },
+                { key: "ports",    labelKey: "layerPorts",    color: "#f59e0b", showKey: "showPorts",    toggleKey: "setShowPorts",    loadingKey: "loadingPorts",    errorKey: "errorPorts" },
+                { key: "balisage", labelKey: "layerBalisage", color: "#10b981", showKey: "showBalisage", toggleKey: "setShowBalisage", loadingKey: "loadingBalisage", errorKey: "errorBalisage" },
+              ].map(({ key, labelKey, color, showKey, toggleKey, loadingKey, errorKey }) => {
                 const active  = maritimeLayers[showKey];
                 const loading = maritimeLayers[loadingKey];
+                const error   = maritimeLayers[errorKey];
+                const label   = t(labelKey);
+                const title   = error ? `${label}: ${error} — ${t("layersStartHint")}` : label;
                 return (
                   <button
                     key={key}
                     onClick={() => maritimeLayers[toggleKey]((v) => !v)}
-                    title={label}
+                    title={title}
                     className={[
                       "flex items-center justify-center gap-1 flex-1 px-1.5 py-1 rounded-full",
                       "text-[10px] font-semibold transition-all duration-150 select-none",
@@ -618,12 +622,19 @@ export function Sidebar({ plan, open, onToggle, onRouteImport, onRouteSwitchToBe
                   >
                     {loading
                       ? <div className="w-1.5 h-1.5 rounded-full border border-white/30 border-t-white animate-spin flex-shrink-0" />
-                      : <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: active ? color : "transparent", border: `1.5px solid ${color}` }} />
+                      : <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: active ? color : "transparent", border: `1.5px solid ${error ? "#ef4444" : color}` }} />
                     }
                     {label}
+                    {error && !loading && <span className="text-red-400 text-[9px]">⚠</span>}
                   </button>
                 );
               })}
+              </div>
+              {(maritimeLayers.errorZee || maritimeLayers.errorPorts) && (
+                <div className="text-[9px] text-amber-400/90 px-2" title={t("layersApiHint")}>
+                  {t("layersStartHint")}
+                </div>
+              )}
             </div>
           )}
 

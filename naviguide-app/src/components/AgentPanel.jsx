@@ -273,7 +273,7 @@ export function AgentPanel({ legContext, language = "fr" }) {
                   : "border-transparent text-slate-500 hover:text-slate-300 hover:bg-slate-700/20",
               ].join(" ")}
               style={{ color: isActive ? agent.color : undefined }}
-              title={agent.titleFr}
+              title={t?.(agent.titleKey) ?? agent.titleFr}
             >
               {agentState.loading ? (
                 <div className="w-2 h-2 rounded-full border border-current border-t-transparent animate-spin" />

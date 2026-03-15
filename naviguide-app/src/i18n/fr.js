@@ -123,6 +123,7 @@ export default {
   // ── Polar upload (ExportSidebar) ───────────────────────────────────────────
   polarSection:           "Polaires",
   polarDropZone:          "Glissez un fichier polaire",
+  polarDropToReplace:     "Glissez pour remplacer",
   polarFormats:           "PDF · CSV · XLSX",
   polarAnalyzing:         "Analyse…",
   polarLoaded:            "Polaires chargées",
@@ -130,6 +131,17 @@ export default {
   polarUploadErrorPrefix: "Échec",
   polarUpwind:            "↑ Près",
   polarDownwind:          "↓ Portant",
+
+  // ── Couches maritimes (MaritimeLayersPanel) ─────────────────────────────────
+  layerZee:        "ZEE",
+  layerZeeTitle:   "Zones Économiques Exclusives (VLIZ)",
+  layerPorts:      "Ports WPI",
+  layerPortsTitle: "Ports mondiaux — World Port Index (NGA)",
+  layerBalisage:   "Balisage",
+  layerBalisageTitle: "Balisage maritime (OpenSeaMap)",
+  layersLabel:     "Couches",
+  layersApiHint:   "ZEE et Ports nécessitent naviguide-api (port 8000)",
+  layersStartHint: "Lancer ./naviguide_workspace/start_local.sh",
 
   // ── Polar Chat (Sidebar) ───────────────────────────────────────────────────
   polarChatLoadPrompt:     "Chargez les polaires (panneau droit) pour activer le chat.",

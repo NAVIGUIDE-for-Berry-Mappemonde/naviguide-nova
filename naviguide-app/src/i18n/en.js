@@ -18,7 +18,7 @@ export default {
   highWaves:      "High waves",
   currentSpeed:   "Current: {speed} knots",
   waveApiError:   "Wave API error",
-  waveDataError:  "Impossible to get wave data",
+  waveDataError:  "Unable to retrieve wave data",
   startingPoint:  "Starting point",
   stop:           "Stop",
 
@@ -122,6 +122,7 @@ export default {
   // ── Polar upload (ExportSidebar) ───────────────────────────────────────────
   polarSection:           "Polars",
   polarDropZone:          "Drop a polar file here",
+  polarDropToReplace:     "Drop to replace",
   polarFormats:           "PDF · CSV · XLSX",
   polarAnalyzing:         "Analyzing…",
   polarLoaded:            "Polars loaded",
@@ -129,6 +130,17 @@ export default {
   polarUploadErrorPrefix: "Failed",
   polarUpwind:            "↑ Upwind",
   polarDownwind:          "↓ Downwind",
+
+  // ── Maritime layers (MaritimeLayersPanel) ───────────────────────────────────
+  layerZee:        "EEZ",
+  layerZeeTitle:   "Exclusive Economic Zones (VLIZ)",
+  layerPorts:      "Ports",
+  layerPortsTitle: "World Port Index (NGA)",
+  layerBalisage:   "Buoyage",
+  layerBalisageTitle: "Nautical aids (OpenSeaMap)",
+  layersLabel:     "Layers",
+  layersApiHint:   "EEZ and Ports require naviguide-api (port 8000)",
+  layersStartHint: "Run ./naviguide_workspace/start_local.sh",
 
   // ── Polar Chat (Sidebar) ───────────────────────────────────────────────────
   polarChatLoadPrompt:     "Load polars (right panel) to enable chat.",

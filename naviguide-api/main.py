@@ -5,10 +5,11 @@ import json
 import time
 import asyncio
 from typing import Optional, Union, List
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 import httpx
 import searoute as sr
@@ -656,10 +657,41 @@ def searoute_with_exact_end(start, end):
     return route
 
 
+async def _preload_zee():
+    """Précharge ZEE en arrière-plan au démarrage (VLIZ lent)."""
+    global _zee_cache
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.get(
+                "https://geo.vliz.be/geoserver/MarineRegions/wfs",
+                params={
+                    "service": "WFS",
+                    "version": "1.1.0",
+                    "request": "GetFeature",
+                    "typeName": "eez",
+                    "outputFormat": "application/json",
+                    "maxFeatures": 500,
+                },
+            )
+            if resp.status_code == 200:
+                _zee_cache["data"] = resp.json()
+                _zee_cache["ts"] = time.time()
+                print("✅ ZEE préchargé (cache 24 h)")
+    except Exception as e:
+        print(f"⚠️ ZEE préchargement: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    asyncio.create_task(_preload_zee())
+    yield
+
+
 app = FastAPI(
     title="NAVIGUIDE API",
     description="API pour calculer un itinéraire maritime — Berry-Mappemonde Expedition.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -676,13 +708,26 @@ class PositionRequest(BaseModel):
     longitude: float
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def read_root():
-    return {
-        "message": "NAVIGUIDE API is running",
-        "version": "1.0.0",
-        "copernicus_configured": bool(COPERNICUS_USERNAME and COPERNICUS_PASSWORD)
-    }
+    """Page d'accueil — liens vers la doc et les endpoints."""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"><title>NAVIGUIDE API</title></head>
+    <body style="font-family:sans-serif;max-width:600px;margin:2rem auto;padding:1rem;">
+      <h1>NAVIGUIDE API</h1>
+      <p>API de routage maritime — Berry-Mappemonde</p>
+      <ul>
+        <li><a href="/docs">Documentation Swagger</a></li>
+        <li><a href="/redoc">Documentation ReDoc</a></li>
+        <li><a href="/proxy/zee?maxFeatures=5">ZEE (test)</a></li>
+        <li><a href="/proxy/ports">Ports (test)</a></li>
+      </ul>
+      <p><small>Version 1.0.0</small></p>
+    </body>
+    </html>
+    """
 
 
 @app.get("/route")
@@ -844,6 +889,10 @@ def get_current(request: PositionRequest):
 _wpi_cache: dict = {"data": None, "ts": 0.0}
 _WPI_CACHE_TTL = 86_400  # seconds
 
+# Cache ZEE (VLIZ très lent — 30–60 s). 24 h TTL.
+_zee_cache: dict = {"data": None, "ts": 0.0}
+_ZEE_CACHE_TTL = 86_400
+
 # DMS coordinate pattern: e.g. "30°20'00\"N" or "48°17'00\"E"
 _DMS_RE = re.compile(
     r"""(\d+)\s*[°d]\s*(\d+)\s*[''′]\s*(\d+(?:\.\d+)?)\s*[""″]?\s*([NSEW]?)""",
@@ -878,18 +927,58 @@ def _parse_coord(value: Optional[Union[str, float, int]]) -> Optional[float]:
     return None
 
 
+# ── ZEE WMS : tuiles à la demande (instantané, pas de timeout) ─────────────────
+_VLIZ_WMS = "https://geo.vliz.be/geoserver/MarineRegions/wms"
+
+
+@app.get("/proxy/zee/wms", summary="ZEE WMS tile proxy (VLIZ)")
+async def proxy_zee_wms(request: Request):
+    """
+    Proxy WMS GetMap pour les ZEE. Tuiles à la demande — chargement instantané.
+    MapLibre envoie BBOX, WIDTH, HEIGHT ; on forward à VLIZ.
+    """
+    params = dict(request.query_params)
+    bbox = params.get("bbox") or params.get("BBOX")
+    if not bbox:
+        raise HTTPException(status_code=400, detail="Missing bbox parameter")
+    params.setdefault("service", "WMS")
+    params.setdefault("version", "1.1.1")
+    params.setdefault("request", "GetMap")
+    params["layers"] = "eez_boundaries"  # Limites uniquement (polylignes, pas de polygones)
+    params.setdefault("format", "image/png")
+    params.setdefault("transparent", "true")
+    params.setdefault("srs", "EPSG:3857")
+    # 512×512 pour rendu plus fin au zoom minimal (client envoie WIDTH/HEIGHT)
+    params.setdefault("width", "512")
+    params.setdefault("height", "512")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(_VLIZ_WMS, params=params)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"VLIZ WMS HTTP {resp.status_code}")
+            return Response(content=resp.content, media_type="image/png")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"VLIZ WMS error: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ZEE WMS error: {exc}")
+
+
 @app.get("/proxy/zee", summary="ZEE boundaries proxy (VLIZ WFS)")
 async def proxy_zee(
     bbox: Optional[str] = Query(
         None,
         description="Viewport bounding box as minlon,minlat,maxlon,maxlat (CRS:84)",
     ),
-    maxFeatures: int = Query(50, ge=1, le=500, description="Max EEZ polygons to return"),
+    maxFeatures: int = Query(500, ge=1, le=500, description="Max EEZ polygons to return"),
 ):
     """
     Proxy pour l'API WFS VLIZ Marine Regions — ZEE (Zones Économiques Exclusives).
-    Contourne les restrictions CORS du serveur VLIZ.
+    Cache 24 h côté serveur (VLIZ très lent). Premier chargement ~30–60 s.
     """
+    # Cache global (sans bbox) — couverture mondiale
+    if not bbox and _zee_cache["data"] and (time.time() - _zee_cache["ts"] < _ZEE_CACHE_TTL):
+        return JSONResponse(content=_zee_cache["data"])
+
     params: dict = {
         "service": "WFS",
         "version": "1.1.0",
@@ -901,13 +990,17 @@ async def proxy_zee(
     if bbox:
         params["bbox"] = bbox
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.get(
                 "https://geo.vliz.be/geoserver/MarineRegions/wfs",
                 params=params,
             )
             resp.raise_for_status()
-            return JSONResponse(content=resp.json())
+            data = resp.json()
+            if not bbox:
+                _zee_cache["data"] = data
+                _zee_cache["ts"] = time.time()
+            return JSONResponse(content=data)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"ZEE upstream HTTP error: {exc.response.status_code}")
     except Exception as exc:
@@ -965,8 +1058,61 @@ async def proxy_ports():
     return JSONResponse(content=geojson)
 
 
-# NOTE: SHOM WFS /proxy/balisage removed — endpoint requires authentication (401).
-# Balisage is now served client-side via OpenSeaMap raster tiles (no proxy needed).
+# ── Balisage : proxy OpenSeaMap seamark tiles (contourne erreurs 500 du serveur) ──
+
+_OPENSEAMAP_HOSTS = ["tiles.openseamap.org", "t1.openseamap.org"]
+
+# PNG transparent 256×256 (évite les coupures visibles aux frontières de tuiles)
+def _transparent_tile_256() -> bytes:
+    try:
+        from PIL import Image
+        import io
+        img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+    except ImportError:
+        return b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+
+_TRANSPARENT_TILE = None
+
+def _get_transparent_tile() -> bytes:
+    global _TRANSPARENT_TILE
+    if _TRANSPARENT_TILE is None:
+        _TRANSPARENT_TILE = _transparent_tile_256()
+    return _TRANSPARENT_TILE
+
+
+@app.get("/proxy/seamark/{z:int}/{x:int}/{y}.png", summary="OpenSeaMap seamark tile proxy")
+async def proxy_seamark(z: int, x: int, y: str):
+    """
+    Proxy pour les tuiles balisage OpenSeaMap (seamark).
+    Essaie plusieurs serveurs (tiles, t1) pour améliorer la couverture.
+    Tuiles 404 → PNG transparent 256×256 pour éviter les coupures visibles.
+    """
+    try:
+        y_int = int(y)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid tile y")
+
+    last_error = None
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for host in _OPENSEAMAP_HOSTS:
+            url = f"https://{host}/seamark/{z}/{x}/{y_int}.png"
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    return Response(content=resp.content, media_type="image/png")
+                if resp.status_code == 404:
+                    last_error = "404"
+                    continue
+                last_error = f"HTTP {resp.status_code}"
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+    # Tous les serveurs ont échoué → tuile transparente 256×256
+    return Response(content=_get_transparent_tile(), media_type="image/png")
 
 
 # ── Simulation Mode — Geometry Helpers ───────────────────────────────────────

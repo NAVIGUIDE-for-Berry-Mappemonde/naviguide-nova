@@ -12,6 +12,7 @@ import {
   useMaritimeLayers,
   MaritimeLayers,
   MaritimeLayersPanel,
+  BalisageLayer,
 } from "./components/MaritimeLayers";
 import { useMarkerOffsets } from "./hooks/useMarkerOffsets";
 import { CatamaranMarker } from "./components/CatamaranMarker";
@@ -468,7 +469,7 @@ export default function App() {
     ]);
 
     // Points dont la liaison séquentielle est remplacée par des legs personnalisés
-    // Marigot→Cayenne (insert), Cayenne→Halifax (aucun trajet!), Halifax→SPM (découplé), SPM→Papeete (aucun trajet!)
+    // Marigot→Cayenne, Halifax→SPM, SPM→Halifax, Cayenne→Papeete (pas de segment Cayenne↔Halifax)
     const skipFromNames = new Set([
       "Marigot (Saint-Martin)",
       "Cayenne (Guyane)",
@@ -492,18 +493,14 @@ export default function App() {
       to: byName("Cayenne (Guyane)"),
     });
 
-    // Insert Cayenne → Papeete (trajet maritime direct, pas de passage par Halifax/SPM)
+    // Après Cayenne : Halifax → SPM → Halifax (air, non symbolisé), puis Cayenne → Papeete (maritime).
+    // Pas de segment Cayenne↔Halifax : les trajets aériens ne sont pas ajoutés ni affichés.
     const cayenneIdx = legs.findIndex((l) => l.to.name === "Cayenne (Guyane)");
-    legs.splice(cayenneIdx + 1, 0, {
-      from: byName("Cayenne (Guyane)"),
-      to: byName("Papeete (Polynésie française)"),
-    });
-
-    // Insert Halifax → SPM (segment maritime découplé, affiché en pointillés) après Cayenne→Papeete
-    legs.splice(cayenneIdx + 2, 0, {
-      from: byName("Halifax (Nouvelle-Écosse)"),
-      to: byName("Saint-Pierre (Saint-Pierre-et-Miquelon)"),
-    });
+    legs.splice(cayenneIdx + 1, 0,
+      { from: byName("Halifax (Nouvelle-Écosse)"), to: byName("Saint-Pierre (Saint-Pierre-et-Miquelon)") },
+      { from: byName("Saint-Pierre (Saint-Pierre-et-Miquelon)"), to: byName("Halifax (Nouvelle-Écosse)") },
+      { from: byName("Cayenne (Guyane)"), to: byName("Papeete (Polynésie française)") },
+    );
 
     // ── Segment direction guard ──────────────────────────────────────────────
     // searoute may return coords in either direction (A→B or B→A).
@@ -543,7 +540,7 @@ export default function App() {
           start_lon: leg.from.lon,
           end_lat: leg.to.lat,
           end_lon: leg.to.lon,
-          check_wind: true,
+          check_wind: false,
         });
         const res = await fetch(`${API_URL}/route?${params}`);
         const data = await res.json();
@@ -868,6 +865,14 @@ export default function App() {
           });
         }}
       >
+        {/* ── Maritime data layers (ZEE / Ports / Balisage) — AVANT les routes pour être en dessous ── */}
+        <MaritimeLayers
+          showZee={maritimeLayers.showZee}
+          showPorts={maritimeLayers.showPorts}
+          portsData={maritimeLayers.portsData}
+          showBalisage={maritimeLayers.showBalisage}
+        />
+
         {/* Lignes maritimes */}
         <Source id="maritime" type="geojson" data={maritimeLines}>
           <Layer
@@ -1542,16 +1547,6 @@ export default function App() {
           </Popup>
         )}
 
-        {/* ── Maritime data layers (ZEE / Ports WPI / Balisage SHOM) ─────── */}
-        <MaritimeLayers
-          showZee={maritimeLayers.showZee}
-          zeeData={maritimeLayers.zeeData}
-          showPorts={maritimeLayers.showPorts}
-          portsData={maritimeLayers.portsData}
-          showBalisage={maritimeLayers.showBalisage}
-          balisageData={maritimeLayers.balisageData}
-        />
-
         {/* ── Catamaran simulation marker ────────────────────────────────── */}
         {simulationMode && (
           <CatamaranMarker
@@ -1651,6 +1646,9 @@ export default function App() {
             </Marker>
           )
         )}
+
+        {/* Balisage — raster AU-DESSUS de tout (routes, markers) pour être visible */}
+        <BalisageLayer show={maritimeLayers.showBalisage} />
       </Map>
     </div>
   );
