@@ -23,13 +23,7 @@ Graph flow:
 """
 
 from datetime import datetime
-from langchain_core.messages import HumanMessage, AIMessage
-
-try:
-    from langchain_aws import ChatBedrock
-    _BEDROCK_AVAILABLE = True
-except (ImportError, Exception):
-    _BEDROCK_AVAILABLE = False
+from langchain_core.messages import AIMessage, HumanMessage
 
 from .state       import RiskState
 from .risk_engine import RiskAssessmentEngine
@@ -234,16 +228,14 @@ Produce a structured skipper briefing with EXACTLY these sections:
 Professional maritime tone. Max 200 words total."""
 
     summary = ""
-
-    if _BEDROCK_AVAILABLE:
-        try:
-            llm     = ChatBedrock(model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0", region_name="us-east-1")
-            summary = llm.invoke([HumanMessage(content=prompt)]).content
-        except Exception as exc:
-            summary = (
-                f"LLM risk analyst unavailable ({exc}). "
-                "Manual review of CRITICAL/HIGH waypoints recommended."
-            )
+    try:
+        from llm_utils import invoke_llm
+        summary = invoke_llm(prompt, fallback_msg="Manual review of CRITICAL/HIGH waypoints recommended.")
+    except Exception as exc:
+        summary = (
+            f"LLM risk analyst unavailable ({exc}). "
+            "Manual review of CRITICAL/HIGH waypoints recommended."
+        )
 
     if not summary:
         summary = (

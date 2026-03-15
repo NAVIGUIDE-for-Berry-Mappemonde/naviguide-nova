@@ -11,6 +11,11 @@ GET  /api/v1/expedition/graph            LangGraph orchestration diagram
 GET  /api/v1/expedition/status           Live agent availability check
 """
 
+# Load .env before any Bedrock/LLM imports (Nova + Claude credentials)
+from pathlib import Path as _Path
+from dotenv import load_dotenv
+load_dotenv(_Path(__file__).resolve().parents[1] / ".env")
+
 import logging
 import os
 import sys

@@ -32,5 +32,10 @@ __pycache__/
 # Polar data (runtime)
 naviguide_workspace/polar_data/
 
+# Geospatial data (large files)
+data/gebco/*.nc
+data/ais_worldbank/*.zip
+data/ais_worldbank/*.tif
+
 # Vite build output
 naviguide-app/dist/

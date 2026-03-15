@@ -24,13 +24,7 @@ import urllib.request
 import urllib.error
 import json
 from datetime import datetime
-from langchain_core.messages import HumanMessage, AIMessage
-
-try:
-    from langchain_aws import ChatBedrock
-    _BEDROCK_AVAILABLE = True
-except (ImportError, Exception):
-    _BEDROCK_AVAILABLE = False
+from langchain_core.messages import AIMessage, HumanMessage
 
 from .state  import RouteState
 from .router import BerryMappemondeRouter
@@ -230,16 +224,14 @@ Your task:
 Tone: professional, concise, offshore-sailing expertise. Max 120 words."""
 
     advice = ""
-
-    if _BEDROCK_AVAILABLE:
-        try:
-            llm    = ChatBedrock(model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0", region_name="us-east-1")
-            advice = llm.invoke([HumanMessage(content=prompt)]).content
-        except Exception as exc:
-            advice = (
-                f"LLM advisor unavailable ({exc}). "
-                "Manual review recommended for segments scoring below 0.70."
-            )
+    try:
+        from llm_utils import invoke_llm
+        advice = invoke_llm(prompt, fallback_msg="Manual review recommended for segments scoring below 0.70.")
+    except Exception as exc:
+        advice = (
+            f"LLM advisor unavailable ({exc}). "
+            "Manual review recommended for segments scoring below 0.70."
+        )
 
     if not advice:
         advice = (

@@ -10,7 +10,7 @@ GET  /                                      Health check
 POST /api/v1/polar/upload                   Upload PDF → parse → store 181×61 grid
 GET  /api/v1/polar/{expedition_id}          Retrieve full polar grid (181×61)
 GET  /api/v1/polar/{expedition_id}/summary  VMG summary only (lightweight, for briefing agents)
-POST /api/v1/polar/chat                     Polar agent chat (VMG-aware, Anthropic-backed)
+POST /api/v1/polar/chat                     Polar agent chat (VMG-aware, Nova + Claude)
 """
 
 import json
@@ -27,17 +27,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Load workspace .env (ANTHROPIC_API_KEY)
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
-# Anthropic client (optional — chat falls back gracefully)
-try:
-    import anthropic as _anthropic
-    _ANTHROPIC_CLIENT    = _anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    _ANTHROPIC_AVAILABLE = bool(os.getenv("ANTHROPIC_API_KEY"))
-except Exception:
-    _ANTHROPIC_CLIENT    = None
-    _ANTHROPIC_AVAILABLE = False
+# Load workspace .env (AWS_BEARER_TOKEN_BEDROCK for Nova + Claude)
+_WS = Path(__file__).resolve().parents[1]
+load_dotenv(_WS / ".env")
+if str(_WS) not in sys.path:
+    sys.path.insert(0, str(_WS))
 
 # ── Path setup: import polar_engine from polar_agent/ at repo root ─────────────
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent   # naviguide-berry-mappemonde/
@@ -325,8 +319,8 @@ Be concise (max 120 words), precise, and use nautical terms. Always cite specifi
 async def polar_chat(request: PolarChatRequest):
     """
     Chat with the polar agent about boat polar performance.
-    Loads VMG context for the expedition, answers via Anthropic Claude.
-    Falls back to a structured answer if Anthropic is unavailable.
+    Loads VMG context for the expedition, answers via Nova + Claude (Bedrock).
+    Falls back to a structured answer if LLM is unavailable.
     """
     dest = _polar_path(request.expedition_id)
     if not dest.exists():
@@ -340,28 +334,28 @@ async def polar_chat(request: PolarChatRequest):
 
     system_prompt = _build_polar_system_prompt(polar_data)
 
-    # Build message list for Anthropic
-    messages = [{"role": m["role"], "content": m["content"]} for m in (request.history or [])]
-    messages.append({"role": "user", "content": request.message})
+    # Build prompt from history + new message
+    conv_lines = []
+    for m in (request.history or []):
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        conv_lines.append(f"{role.capitalize()}: {content}")
+    conv_lines.append(f"User: {request.message}")
+    prompt = "\n\n".join(conv_lines)
 
     log.info(f"Polar chat: expedition={request.expedition_id}, msg='{request.message[:60]}'")
 
-    if _ANTHROPIC_AVAILABLE and _ANTHROPIC_CLIENT:
-        try:
-            resp = _ANTHROPIC_CLIENT.messages.create(
-                model      = "claude-haiku-4-5",
-                max_tokens = 300,
-                system     = system_prompt,
-                messages   = messages,
-            )
-            reply  = resp.content[0].text
-            source = "anthropic"
-        except Exception as exc:
-            log.warning(f"Anthropic unavailable ({exc}) — using fallback")
-            reply  = _polar_fallback_reply(request.message, polar_data)
-            source = "fallback"
-    else:
-        reply  = _polar_fallback_reply(request.message, polar_data)
+    try:
+        from llm_utils import invoke_llm
+        reply = invoke_llm(prompt, system=system_prompt, fallback_msg="")
+        source = "nova" if reply else "fallback"
+    except Exception as exc:
+        log.warning(f"LLM unavailable ({exc}) — using fallback")
+        reply = None
+        source = "fallback"
+
+    if not reply:
+        reply = _polar_fallback_reply(request.message, polar_data)
         source = "fallback"
 
     return {

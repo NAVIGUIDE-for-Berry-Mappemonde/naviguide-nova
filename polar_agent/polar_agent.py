@@ -14,9 +14,10 @@ import os
 import json
 import logging
 import re
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
-import requests
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 
@@ -24,75 +25,24 @@ from polar_engine import PolarData
 
 log = logging.getLogger("polar_agent")
 
-AUTH_URL = "https://api-auth.dev.deploy.ai/oauth2/token"
-API_URL  = "https://core-api.dev.deploy.ai"
-ORG_ID   = os.getenv("ORG_ID", "f3e01a12-b6aa-43ac-83bc-d0014e215eed")
-
-# Deploy AI agent ID for Claude Opus 4.1
-CLAUDE_AGENT_ID = "claude_4_1_opus"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Deploy AI helpers — Claude Opus 4.1
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _get_token() -> str:
-    data = {
-        "grant_type":    "client_credentials",
-        "client_id":     os.getenv("CLIENT_ID", ""),
-        "client_secret": os.getenv("CLIENT_SECRET", ""),
-    }
-    r = requests.post(AUTH_URL, data=data, timeout=15)
-    r.raise_for_status()
-    return r.json()["access_token"]
+# Add naviguide_workspace to path for llm_utils (Nova + Claude)
+_WS = Path(__file__).resolve().parents[1] / "naviguide_workspace"
+if str(_WS) not in sys.path:
+    sys.path.insert(0, str(_WS))
+from dotenv import load_dotenv
+load_dotenv(_WS / ".env")
 
 
 def _llm_call(prompt: str) -> str:
     """
-    Single-shot LLM call via Deploy AI → Claude Opus 4.1.
+    Single-shot LLM call via Nova + Claude (Bedrock).
     Falls back to empty string if credentials are missing or service unreachable.
     """
-    client_id = os.getenv("CLIENT_ID", "")
-    if not client_id:
-        log.warning("Deploy AI credentials not configured (CLIENT_ID missing).")
-        return ""
-
     try:
-        token = _get_token()
-
-        headers = {
-            "accept":        "application/json",
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {token}",
-            "X-Org":         ORG_ID,
-        }
-
-        # Create chat with Claude Opus 4.1
-        r = requests.post(
-            f"{API_URL}/chats",
-            headers=headers,
-            json={"agentId": CLAUDE_AGENT_ID, "stream": False},
-            timeout=30,
-        )
-        r.raise_for_status()
-        chat_id = r.json()["id"]
-
-        # Send message
-        r2 = requests.post(
-            f"{API_URL}/messages",
-            headers=headers,
-            json={
-                "chatId": chat_id,
-                "stream": False,
-                "content": [{"type": "text", "value": prompt}],
-            },
-            timeout=90,
-        )
-        r2.raise_for_status()
-        return r2.json()["content"][0]["value"]
-
+        from llm_utils import invoke_llm
+        return invoke_llm(prompt, fallback_msg="") or ""
     except Exception as exc:
-        log.warning(f"Claude Opus 4.1 unavailable: {exc}")
+        log.warning(f"Nova/Claude unavailable: {exc}")
         return ""
 
 

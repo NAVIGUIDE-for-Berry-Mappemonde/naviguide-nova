@@ -22,13 +22,7 @@ import os
 import logging
 from datetime import datetime
 from pathlib import Path
-from langchain_core.messages import HumanMessage, AIMessage
-
-try:
-    from langchain_aws import ChatBedrock
-    _BEDROCK_AVAILABLE = True
-except ImportError:
-    _BEDROCK_AVAILABLE = False
+from langchain_core.messages import AIMessage, HumanMessage
 
 from .state import OrchestratorState
 
@@ -371,17 +365,13 @@ Rédige un briefing skipper avec EXACTEMENT ces 4 sections:
 Ton: professionnel hauturier, concis. Max 280 mots. Rédige l'intégralité du briefing en français."""
 
     briefing = ""
-
-    if _BEDROCK_AVAILABLE:
-        try:
-            llm = ChatBedrock(
-                model_id    = "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-                region_name = "us-east-1",
-            )
-            briefing = llm.invoke([HumanMessage(content=prompt)]).content
-            log.info("[orchestrator] LLM briefing generated via Bedrock")
-        except Exception as exc:
-            log.warning(f"[orchestrator] Bedrock unavailable ({exc}) — using fallback briefing")
+    try:
+        from llm_utils import invoke_llm
+        briefing = invoke_llm(prompt, fallback_msg="")
+        if briefing:
+            log.info("[orchestrator] LLM briefing generated via Nova/Claude")
+    except Exception as exc:
+        log.warning(f"[orchestrator] LLM unavailable ({exc}) — using fallback briefing")
 
     if not briefing:
         # Structured fallback briefing (includes critical alerts from full risk matrix)
