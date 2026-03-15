@@ -460,15 +460,19 @@ export default function App() {
     // Helper: find a point by name (robust to index changes)
     const byName = (name) => points.find((p) => p.name === name);
 
-    // Non-maritime segments identified by point names (road/air legs)
+    // Non-maritime segments (road/air only)
+    // Halifax→SPM = segment MARITIME découplé → calculé via searoute, affiché en bleu
     const nonMaritimeNames = new Set([
       "Saint-Maur (Berry, Indre)|La Rochelle",
       "La Rochelle|Saint-Maur (Berry, Indre)",
     ]);
 
-    // Points whose sequential leg (i → i+1) is replaced by a custom leg below
+    // Points dont la liaison séquentielle est remplacée par des legs personnalisés
+    // Marigot→Cayenne (insert), Cayenne→Halifax (aucun trajet!), Halifax→SPM (découplé), SPM→Papeete (aucun trajet!)
     const skipFromNames = new Set([
       "Marigot (Saint-Martin)",
+      "Cayenne (Guyane)",
+      "Halifax (Nouvelle-Écosse)",
       "Saint-Pierre (Saint-Pierre-et-Miquelon)",
     ]);
 
@@ -481,17 +485,22 @@ export default function App() {
       legs.push({ from: a, to: b });
     }
 
-    // Insert Marigot → Cayenne right after the leg that arrives at Marigot,
-    // so it is fetched and rendered in itinerary order (before Cayenne → Papeete…).
+    // Insert Marigot → Cayenne après la leg qui arrive à Marigot
     const marigotIdx = legs.findIndex((l) => l.to.name === "Marigot (Saint-Martin)");
     legs.splice(marigotIdx + 1, 0, {
       from: byName("Marigot (Saint-Martin)"),
       to: byName("Cayenne (Guyane)"),
     });
 
-    // Insert Halifax → Saint-Pierre right after the leg that arrives at Halifax.
-    const halifaxIdx = legs.findIndex((l) => l.to.name === "Halifax (Nouvelle-Écosse)");
-    legs.splice(halifaxIdx + 1, 0, {
+    // Insert Cayenne → Papeete (trajet maritime direct, pas de passage par Halifax/SPM)
+    const cayenneIdx = legs.findIndex((l) => l.to.name === "Cayenne (Guyane)");
+    legs.splice(cayenneIdx + 1, 0, {
+      from: byName("Cayenne (Guyane)"),
+      to: byName("Papeete (Polynésie française)"),
+    });
+
+    // Insert Halifax → SPM (segment maritime découplé, affiché en pointillés) après Cayenne→Papeete
+    legs.splice(cayenneIdx + 2, 0, {
       from: byName("Halifax (Nouvelle-Écosse)"),
       to: byName("Saint-Pierre (Saint-Pierre-et-Miquelon)"),
     });

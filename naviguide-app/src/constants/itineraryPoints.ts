@@ -99,7 +99,14 @@ export const ITINERARY_POINTS = [
     flag: saintMartin,
   },
   {
-    // snapped 0.79 km offshore — east into harbour
+    // snapped 2.22 km offshore — west into the Cayenne river estuary
+    name: "Cayenne (Guyane)",
+    lat: 4.9333,
+    lon: -52.3533,
+    flag: guyane,
+  },
+  {
+    // snapped 0.79 km offshore — east into harbour (segment maritime découplé)
     name: "Halifax (Nouvelle-Écosse)",
     lat: 44.6488,
     lon: -63.5652,
@@ -111,13 +118,6 @@ export const ITINERARY_POINTS = [
     lat: 46.7761,
     lon: -56.1628,
     flag: saintPierreMiquelon,
-  },
-  {
-    // snapped 2.22 km offshore — west into the Cayenne river estuary
-    name: "Cayenne (Guyane)",
-    lat: 4.9333,
-    lon: -52.3533,
-    flag: guyane,
   },
   {
     // snapped 4.55 km offshore — north into Papeete roadstead
