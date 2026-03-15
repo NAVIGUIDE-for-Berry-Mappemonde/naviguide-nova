@@ -230,32 +230,56 @@ export function useLegContext(
     const [bLon, bLat] = polyline[bestSegIdx + 1];
     nmCoveredTotal += bestT * haversineNm(aLat, aLon, bLat, bLon);
 
-    // ── 5. Identification du tronçon actif (mapping monotone) ────────────────
-    // Le mapping monotone garantit que stops identiques géographiquement mais
-    // différents chronologiquement (ex: Cap Verde aller vs retour) sont mappés
-    // à des index de polyligne distincts et croissants.
+    // ── 5. Identification du tronçon actif (from/to du segment) ───────────────
+    // Utiliser directement le segment contenant bestSegIdx : la route a des stops
+    // répétés (Halifax, Cayenne) donc buildMonotonicStopIndices donne des faux positifs
+    // (ex: SPM→Papeete au lieu de SPM→Halifax). Le segment actif donne le bon from/to.
+    let fromStop = null;
+    let toStop   = null;
+    let fromIdx  = 0;
+    let toIdx    = 0;
+    let useSegmentBased = false;
+
+    let activeSegIdx = 0;
+    for (let si = 0; si < routeSegments.length; si++) {
+      const end = segPolyStart[si + 1] ?? polyline.length;
+      if (bestSegIdx < end) {
+        activeSegIdx = si;
+        break;
+      }
+    }
+    const activeSeg = routeSegments[activeSegIdx];
     const stops = (itineraryPoints || []);
     const stopIndices = buildMonotonicStopIndices(stops, polyline);
 
-    let fromStop = stopIndices[0]?.stop;
-    let toStop   = stopIndices[stopIndices.length - 1]?.stop;
-    let fromIdx  = 0;
-    let toIdx    = stopIndices.length - 1;
-
-    for (let i = 0; i < stopIndices.length; i++) {
-      if (stopIndices[i].polyIdx > bestSegIdx) {
-        toStop   = stopIndices[i].stop;
-        toIdx    = i;
-        // Quand i=0 (catamaran avant la première escale), fromStop = null
-        // pour afficher "Départ" au lieu de dupliquer le même stop en from ET to.
-        fromStop = i > 0 ? stopIndices[i - 1].stop : null;
-        fromIdx  = i > 0 ? i - 1 : 0;
-        break;
+    if (activeSeg?.from?.name && activeSeg?.to?.name) {
+      useSegmentBased = true;
+      fromStop = activeSeg.from;
+      toStop   = activeSeg.to;
+      fromIdx = stopIndices.findIndex((s) => s.stop?.name === fromStop?.name);
+      toIdx   = stopIndices.findIndex((s) => s.stop?.name === toStop?.name);
+      if (fromIdx < 0) fromIdx = 0;
+      if (toIdx < 0) toIdx = Math.max(0, fromIdx + 1);
+    } else {
+      fromStop = stopIndices[0]?.stop;
+      toStop   = stopIndices[stopIndices.length - 1]?.stop;
+      fromIdx  = 0;
+      toIdx    = stopIndices.length - 1;
+      for (let i = 0; i < stopIndices.length; i++) {
+        if (stopIndices[i].polyIdx > bestSegIdx) {
+          toStop   = stopIndices[i].stop;
+          toIdx    = i;
+          fromStop = i > 0 ? stopIndices[i - 1].stop : null;
+          fromIdx  = i > 0 ? i - 1 : 0;
+          break;
+        }
       }
     }
 
     // ── 6. Miles nautiques restants jusqu'au prochain stop ───────────────────
-    const toStopPolyIdx = stopIndices[toIdx]?.polyIdx ?? polyline.length - 1;
+    const toStopPolyIdx = useSegmentBased
+      ? (segPolyStart[activeSegIdx + 1] ?? polyline.length) - 1
+      : (stopIndices[toIdx]?.polyIdx ?? polyline.length - 1);
     let nmRemainingToStop = 0;
     if (toStopPolyIdx > bestSegIdx) {
       // Portion restante du segment actif
