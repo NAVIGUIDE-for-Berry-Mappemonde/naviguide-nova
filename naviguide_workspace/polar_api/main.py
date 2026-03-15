@@ -11,6 +11,7 @@ POST /api/v1/polar/upload                   Upload PDF → parse → store 181×
 GET  /api/v1/polar/{expedition_id}          Retrieve full polar grid (181×61)
 GET  /api/v1/polar/{expedition_id}/summary  VMG summary only (lightweight, for briefing agents)
 POST /api/v1/polar/chat                     Polar agent chat (VMG-aware, Nova + Claude)
+POST /api/v1/chat                           General nav chat (expedition or leg context)
 """
 
 import json
@@ -364,6 +365,161 @@ async def polar_chat(request: PolarChatRequest):
         "expedition_id": request.expedition_id,
         "boat_name":    polar_data.get("boat_name"),
     }
+
+
+# ── General Nav Chat (expedition + simulation) ─────────────────────────────────
+
+class NavChatRequest(BaseModel):
+    mode:     str   # "expedition" | "simulation"
+    context:  Dict[str, Any]
+    message:  str
+    history:  Optional[List[Dict[str, str]]] = []
+
+
+def _build_system_prompt_from_context(mode: str, ctx: Dict[str, Any]) -> str:
+    """Build system prompt from pre-built context (frontend sends summarized context)."""
+    lang = ctx.get("language", "fr")
+    lang_full = "French" if lang == "fr" else "English"
+
+    if mode == "expedition":
+        summary = ctx.get("summary", {})
+        briefing = ctx.get("briefing", "")
+        alerts = ctx.get("critical_alerts", [])
+        waypoints = ctx.get("waypoints", [])
+        legs = ctx.get("legs_summary", [])
+        polar = ctx.get("polar_summary", {})
+        satellite = ctx.get("satellite_summary", "")
+
+        stats = (
+            f"Distance: {summary.get('total_distance_nm', '—')} nm | "
+            f"Segments: {summary.get('total_segments', '—')} | "
+            f"Risk: {summary.get('expedition_risk_level', '—')}"
+        )
+        alerts_txt = "\n".join(
+            f"• {a.get('waypoint', '?')}: {a.get('risk_level', '?')} — {a.get('dominant_risk', '')}"
+            for a in (alerts[:5] or [])
+        ) or "Aucune alerte critique."
+        legs_txt = "\n".join(
+            f"• {l.get('from', '?')} → {l.get('to', '?')}: {l.get('distance_nm', '?')} nm"
+            for l in (legs[:20] or [])
+        ) or "—"
+        wp_txt = ", ".join(w.get("name", "?") for w in (waypoints[:30] or [])) or "—"
+        polar_txt = (
+            f"Boat: {polar.get('boat_name', '—')} | "
+            f"VMG upwind @12kt: {polar.get('vmg_at_12kt', {}).get('upwind_vmg', '—')} kts | "
+            f"VMG downwind @12kt: {polar.get('vmg_at_12kt', {}).get('downwind_vmg', '—')} kts"
+        )
+
+        return f"""Tu es l'assistant NAVIGUIDE pour l'expédition Berry-Mappemonde — tour du monde en catamaran.
+
+CONTEXTE EXPÉDITION:
+{stats}
+
+BRIEFING:
+{briefing[:2000] if briefing else "—"}
+
+ALERTES CRITIQUES:
+{alerts_txt}
+
+WAYPOINTS: {wp_txt}
+
+LEGS (résumé):
+{legs_txt}
+
+POLAIRES: {polar_txt}
+
+DONNÉES SATELLITE (vent/vague/courant sur la route): {satellite or "Données intégrées sur les segments."}
+
+Réponds aux questions du skipper en t'appuyant UNIQUEMENT sur ces données. Si une information n'est pas dans le contexte, dis-le clairement.
+Sois concis, précis, utilise le vocabulaire maritime. Max 200 mots par réponse sauf si le skipper demande plus de détails.
+Langue de réponse : {lang_full}."""
+
+    else:
+        # mode == "simulation"
+        leg = ctx.get("leg", {})
+        expedition = ctx.get("expedition_summary", {})
+        polar = ctx.get("polar_summary", {})
+        satellite = ctx.get("satellite_data", {})
+        alerts = ctx.get("alerts_on_leg", [])
+
+        wind = satellite.get("wind", {}) or {}
+        wave = satellite.get("wave", {}) or {}
+        current = satellite.get("current", {}) or {}
+
+        wind_txt = (
+            f"{wind.get('wind_speed_knots', wind.get('speed_knots', '?'))} kt from "
+            f"{wind.get('wind_direction', wind.get('direction', '?'))}°"
+        ) if wind else "N/A"
+        wave_txt = (
+            f"{wave.get('significant_wave_height_m', wave.get('height_m', '?'))} m, "
+            f"{wave.get('mean_wave_period', '?')} s"
+        ) if wave else "N/A"
+        curr_txt = (
+            f"{current.get('speed_knots', '?')} kt @ {current.get('direction_deg', '?')}°"
+        ) if current else "N/A"
+
+        return f"""Tu es l'assistant NAVIGUIDE pour l'expédition Berry-Mappemonde. Le skipper est en mode simulation sur le leg actif.
+
+LEG ACTIF:
+• De {leg.get('from_stop', '?')} vers {leg.get('to_stop', '?')}
+• Position: {leg.get('lat', '?')}° / {leg.get('lon', '?')}°
+• Distance restante: {leg.get('nm_remaining_to_stop', '?')} nm
+• ETA: {leg.get('eta_hours', '?')} h
+• Cap: {leg.get('bearing', '?')}°
+• Vitesse: {leg.get('speed_knots', '?')} kt
+
+DONNÉES SATELLITE À LA POSITION:
+• Vent: {wind_txt}
+• Vague: {wave_txt}
+• Courant: {curr_txt}
+
+EXPÉDITION: {expedition.get('total_distance_nm', '?')} nm, risque {expedition.get('expedition_risk_level', '?')}
+POLAIRES: {polar.get('boat_name', '?')}, VMG upwind/downwind @ 12 kt
+ALERTES SUR CE LEG: {', '.join(a.get('waypoint', '') for a in alerts) or 'Aucune'}
+
+Réponds aux questions en te basant sur ce contexte. Priorise les infos du leg actif.
+Concis, vocabulaire maritime. Max 200 mots. Langue : {lang_full}."""
+
+
+@app.post("/api/v1/chat")
+async def nav_chat(request: NavChatRequest):
+    """
+    Chat with full expedition or leg context.
+    mode=expedition: plan, briefing, alerts, segments, polar, satellite summary.
+    mode=simulation: leg context + satellite data at position.
+    """
+    if request.mode not in ("expedition", "simulation"):
+        raise HTTPException(status_code=400, detail="mode must be 'expedition' or 'simulation'")
+
+    system_prompt = _build_system_prompt_from_context(request.mode, request.context)
+
+    conv_lines = []
+    for m in (request.history or []):
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        conv_lines.append(f"{role.capitalize()}: {content}")
+    conv_lines.append(f"User: {request.message}")
+    prompt = "\n\n".join(conv_lines)
+
+    log.info(f"Nav chat: mode={request.mode}, msg='{request.message[:60]}'")
+
+    try:
+        from llm_utils import invoke_llm
+        reply = invoke_llm(prompt, system=system_prompt, fallback_msg="")
+        source = "nova" if reply else "fallback"
+    except Exception as exc:
+        log.warning(f"LLM unavailable ({exc}) — using fallback")
+        reply = None
+        source = "fallback"
+
+    if not reply:
+        reply = (
+            "[NAVIGUIDE — Service temporairement indisponible.] "
+            "Réessayez dans quelques instants ou consultez les ressources de secours (Windy, Passage Weather)."
+        )
+        source = "fallback"
+
+    return {"reply": reply, "source": source, "mode": request.mode}
 
 
 def _polar_fallback_reply(message: str, data: Dict[str, Any]) -> str:

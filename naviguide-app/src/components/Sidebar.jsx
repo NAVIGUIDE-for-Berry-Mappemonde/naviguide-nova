@@ -9,11 +9,13 @@ import { riskBadgeClass } from "../utils/riskColors";
 import { useLang } from "../i18n/LangContext.jsx";
 import { SimulationPanel } from "./SimulationPanel";
 import { AgentPanel } from "./AgentPanel";
+import { buildChatContext } from "../utils/buildChatContext";
 
 const POLAR_API_URL = import.meta.env.VITE_POLAR_API_URL ?? "http://localhost:8004";
+const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
-/* ── Polar Chat bubble ───────────────────────────────────────────────────── */
-function PolarChatBubble({ role, content }) {
+/* ── Chat bubble ───────────────────────────────────────────────────────────── */
+function ChatBubble({ role, content }) {
   const isUser = role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-1.5`}>
@@ -28,20 +30,24 @@ function PolarChatBubble({ role, content }) {
   );
 }
 
-/* ── Polar Chat section (rendered inside Sidebar above briefing) ────────── */
-function PolarChatSection({ polarData }) {
+/* ── Nav Chat section — contexte expédition (mode normal) ou leg (simulation) ─── */
+function NavChatSection({ plan, segments, points, polarData, legContext, simulationMode }) {
   const { t } = useLang();
-  const [messages,    setMessages]    = useState([]);
-  const [chatInput,   setChatInput]   = useState("");
+  const [messages, setMessages] = useState([]);
+  const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
-  const chatEndRef  = useRef(null);
+  const messagesContainerRef = useRef(null);
   const textareaRef = useRef(null);
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  const lang = t("_lang") === "fr" ? "fr" : "en";
+  const canChat = simulationMode ? !!legContext : !!plan;
 
-  // Auto-resize textarea as content grows/shrinks
+  // Scroll vers le bas du conteneur messages (pas scrollIntoView qui peut faire remonter la sidebar)
+  useEffect(() => {
+    const el = messagesContainerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, chatLoading]);
+
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -51,20 +57,65 @@ function PolarChatSection({ polarData }) {
 
   const handleSend = async () => {
     const msg = chatInput.trim();
-    if (!msg || chatLoading || !polarData?.expedition_id) return;
-    const userMsg     = { role: "user", content: msg };
+    if (!msg || chatLoading || !canChat) return;
+
+    const userMsg = { role: "user", content: msg };
     const nextHistory = [...messages, userMsg];
     setMessages(nextHistory);
     setChatInput("");
     setChatLoading(true);
+
+    let satelliteData = null;
+    if (simulationMode && legContext?.snappedPosition) {
+      const [lon, lat] = legContext.snappedPosition;
+      try {
+        const [windRes, waveRes, currentRes] = await Promise.all([
+          fetch(`${API_URL}/wind`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ latitude: lat, longitude: lon }),
+          }),
+          fetch(`${API_URL}/wave`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ latitude: lat, longitude: lon }),
+          }),
+          fetch(`${API_URL}/current`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ latitude: lat, longitude: lon }),
+          }),
+        ]);
+        satelliteData = {
+          wind: windRes.ok ? await windRes.json() : null,
+          wave: waveRes.ok ? await waveRes.json() : null,
+          current: currentRes.ok ? await currentRes.json() : null,
+        };
+      } catch {
+        satelliteData = {};
+      }
+    }
+
+    const context = buildChatContext({
+      mode: simulationMode ? "simulation" : "expedition",
+      plan,
+      segments: segments || [],
+      points: points || [],
+      polarData,
+      legContext,
+      satelliteData,
+      language: lang,
+    });
+
     try {
-      const res  = await fetch(`${POLAR_API_URL}/api/v1/polar/chat`, {
-        method:  "POST",
+      const res = await fetch(`${POLAR_API_URL}/api/v1/chat`, {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
-          expedition_id: polarData.expedition_id,
-          message:       msg,
-          history:       messages.slice(-6),
+        body: JSON.stringify({
+          mode: context.mode,
+          context,
+          message: msg,
+          history: messages.slice(-6),
         }),
       });
       const data = await res.json();
@@ -78,25 +129,34 @@ function PolarChatSection({ polarData }) {
   };
 
   const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
   };
+
+  const placeholder = canChat
+    ? (simulationMode ? t("chatAskLeg") : t("polarChatAskPlaceholder"))
+    : t("polarChatLoadFirst");
 
   return (
     <div>
       <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
         <Compass size={12} className="text-blue-400" />
-        Chat
+        Chat {simulationMode && legContext ? `— ${legContext.fromStop} → ${legContext.toStop}` : ""}
       </div>
 
-      {/* Messages */}
       <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">
-        <div className="max-h-48 overflow-y-auto sidebar-scroll px-3 py-3 space-y-0.5">
-          {messages.length === 0 && !polarData && (
+        <div
+          ref={messagesContainerRef}
+          className="max-h-48 overflow-y-auto sidebar-scroll px-3 py-3 space-y-0.5"
+        >
+          {messages.length === 0 && !canChat && (
             <p className="text-xs text-slate-500 text-center py-3">
               {t("polarChatLoadPrompt")}
             </p>
           )}
-          {messages.map((m, i) => <PolarChatBubble key={i} role={m.role} content={m.content} />)}
+          {messages.map((m, i) => <ChatBubble key={i} role={m.role} content={m.content} />)}
           {chatLoading && (
             <div className="flex justify-start mb-1.5">
               <div className="bg-slate-700/60 border border-slate-600/40 px-3 py-2 rounded-xl rounded-bl-none">
@@ -104,18 +164,16 @@ function PolarChatSection({ polarData }) {
               </div>
             </div>
           )}
-          <div ref={chatEndRef} />
         </div>
 
-        {/* Input */}
         <div className="border-t border-slate-700/50 px-3 py-2 flex gap-2 items-end">
           <textarea
             ref={textareaRef}
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={polarData ? t("polarChatAskPlaceholder") : t("polarChatLoadFirst")}
-            disabled={!polarData}
+            placeholder={placeholder}
+            disabled={!canChat}
             rows={1}
             className="flex-1 bg-transparent text-xs text-white placeholder-slate-500 resize-none
               focus:outline-none leading-relaxed disabled:opacity-40 overflow-y-auto"
@@ -123,9 +181,9 @@ function PolarChatSection({ polarData }) {
           />
           <button
             onClick={handleSend}
-            disabled={!chatInput.trim() || chatLoading || !polarData}
+            disabled={!chatInput.trim() || chatLoading || !canChat}
             className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 transition-all
-              ${(!chatInput.trim() || chatLoading || !polarData)
+              ${(!chatInput.trim() || chatLoading || !canChat)
                 ? "text-slate-600 cursor-not-allowed"
                 : "bg-blue-600 hover:bg-blue-500 text-white active:scale-95"}`}
           >
@@ -520,7 +578,7 @@ function BerryCard({ onRouteImport, onRouteSwitchToBerry, isDrawing, onDrawStart
 
 /* ── Main component ───────────────────────────────────────────────────────── */
 
-export function Sidebar({ plan, open, onToggle, onRouteImport, onRouteSwitchToBerry, isDrawing, onDrawStart, onDrawFinish, isCockpit, isOffshore, polarData, maritimeLayers, simulationMode, onSimulationToggle, legContext, onNext, canNext, onPrev, canPrev }) {
+export function Sidebar({ plan, segments, points, open, onToggle, onRouteImport, onRouteSwitchToBerry, isDrawing, onDrawStart, onDrawFinish, isCockpit, isOffshore, polarData, maritimeLayers, simulationMode, onSimulationToggle, legContext, onNext, canNext, onPrev, canPrev }) {
   const { t } = useLang();
   const stats    = plan?.voyage_statistics || {};
   const alerts   = plan?.critical_alerts   || [];
@@ -720,8 +778,15 @@ export function Sidebar({ plan, open, onToggle, onRouteImport, onRouteSwitchToBe
             </div>
           )}
 
-          {/* Polar Chat — always shown above briefing */}
-          <PolarChatSection polarData={polarData} />
+          {/* Nav Chat — contexte expédition (normal) ou leg (simulation) */}
+          <NavChatSection
+            plan={plan}
+            segments={segments}
+            points={points}
+            polarData={polarData}
+            legContext={legContext}
+            simulationMode={simulationMode}
+          />
 
           {/*
             AI Skipper Briefing.

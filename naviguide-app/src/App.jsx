@@ -718,6 +718,8 @@ export default function App() {
     >
       <Sidebar
         plan={expeditionPlan}
+        segments={segments}
+        points={points}
         open={sidebarOpen}
         onToggle={() => setSidebarOpen((o) => !o)}
         onRouteImport={handleRouteImport}

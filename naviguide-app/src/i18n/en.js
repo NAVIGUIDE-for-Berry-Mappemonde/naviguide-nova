@@ -143,9 +143,10 @@ export default {
   layersStartHint: "Run ./naviguide_workspace/start_local.sh",
 
   // ── Polar Chat (Sidebar) ───────────────────────────────────────────────────
-  polarChatLoadPrompt:     "Load polars (right panel) to enable chat.",
-  polarChatAskPlaceholder: "Ask about polars…",
-  polarChatLoadFirst:      "Load polars first",
+  polarChatLoadPrompt:     "Load the plan or enable simulation to activate chat.",
+  polarChatAskPlaceholder: "Ask about expedition, route, polars…",
+  polarChatLoadFirst:      "Load plan or enable simulation",
+  chatAskLeg:              "Ask about this leg, weather, ETA…",
 
   // ── Simulation button (Sidebar) ────────────────────────────────────────────
   simulationModeLabel:   "Simulation Mode",

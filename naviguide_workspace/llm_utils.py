@@ -3,8 +3,8 @@ NAVIGUIDE — LLM invoker for Hackathon Amazon Nova AI
 
 Chain:
   1. Nova 2 Lite (Bedrock)
-  2. Claude 3.5 Sonnet (Bedrock)
-  3. Claude via Anthropic API direct (ANTHROPIC_API_KEY) — si Bedrock bloqué
+  2. Claude via Anthropic API direct (ANTHROPIC_API_KEY) — prioritaire si Nova bloqué
+  3. Claude Bedrock (dernier recours)
   4. None → fallback statique côté caller
 
 Credentials: naviguide_workspace/.env
@@ -21,7 +21,7 @@ log = logging.getLogger("naviguide.llm")
 
 NOVA_MODEL = "us.amazon.nova-2-lite-v1:0"  # US region format
 CLAUDE_BEDROCK_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
-CLAUDE_ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+CLAUDE_ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 REGION = "us-east-1"
 
 
@@ -49,9 +49,28 @@ def invoke_llm(
             log.info(f"[llm] Nova 2 Lite OK ({len(text)} chars)")
             return text.strip()
     except Exception as exc:
-        log.warning(f"[llm] Nova failed: {exc} — trying Claude (Bedrock)")
+        log.warning(f"[llm] Nova failed: {exc} — trying Anthropic API")
 
-    # 2. Claude (Bedrock)
+    # 2. Claude via API Anthropic directe (clé API) — prioritaire car Bedrock peut crasher
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            kwargs = {"model": CLAUDE_ANTHROPIC_MODEL, "max_tokens": 2048, "messages": [{"role": "user", "content": prompt}]}
+            if system:
+                kwargs["system"] = system
+            message = client.messages.create(**kwargs)
+            text = message.content[0].text if message.content else ""
+            if text and text.strip():
+                log.info(f"[llm] Claude Anthropic API OK ({len(text)} chars)")
+                return text.strip()
+        except Exception as exc:
+            log.warning(f"[llm] Claude Anthropic API failed: {exc}")
+    else:
+        log.debug("[llm] ANTHROPIC_API_KEY not set — skipping direct API fallback")
+
+    # 3. Claude (Bedrock) — dernier recours (peut crasher sur certains environnements)
     try:
         from langchain_aws import ChatBedrock
         from langchain_core.messages import HumanMessage
@@ -63,27 +82,7 @@ def invoke_llm(
             log.info(f"[llm] Claude Bedrock OK ({len(text)} chars)")
             return str(text).strip()
     except Exception as exc:
-        log.warning(f"[llm] Claude Bedrock failed: {exc} — trying Anthropic API")
-
-    # 3. Claude via API Anthropic directe (clé API)
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if api_key:
-        try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=api_key)
-            message = client.messages.create(
-                model=CLAUDE_ANTHROPIC_MODEL,
-                max_tokens=2048,
-                messages=[{"role": "user", "content": full_prompt}],
-            )
-            text = message.content[0].text if message.content else ""
-            if text and text.strip():
-                log.info(f"[llm] Claude Anthropic API OK ({len(text)} chars)")
-                return text.strip()
-        except Exception as exc:
-            log.warning(f"[llm] Claude Anthropic API failed: {exc}")
-    else:
-        log.debug("[llm] ANTHROPIC_API_KEY not set — skipping direct API fallback")
+        log.warning(f"[llm] Claude Bedrock failed: {exc}")
 
     return None
 
